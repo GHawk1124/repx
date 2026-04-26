@@ -1,0 +1,156 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\title{repx: Kernel-Level Process Attestation for Reproducible Build Provenance}
+\author{Anonymous}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Software supply-chain security has focused heavily on artifact metadata (for example, SBOMs), but many high-impact compromises occur in the \emph{build process} itself. This paper presents \texttt{repx}, a Linux prototype that generates cryptographic attestations of build-time process behavior by tracing kernel events with eBPF, canonicalizing them into system-independent operations, and hashing them into a Merkle-tree commitment. The main research value is methodological: \texttt{repx} shows how to turn low-level runtime traces into deterministic provenance summaries suitable for verification and divergence analysis. We describe the architecture, define the achieved guarantees, and identify open research problems (coverage, loss handling, and formal security properties). The contribution is not merely a tool implementation, but an executable design pattern for process-centric provenance in reproducible systems.
+\end{abstract}
+
+\section{Introduction}
+Build reproducibility and software provenance are central topics in modern software assurance. Existing approaches often verify \emph{what} dependencies were declared or \emph{what} artifact was produced, but they are less effective at proving \emph{how} the artifact was produced at runtime. This gap is important because attacker behavior frequently manifests as extra file accesses, unauthorized process launches, or hidden outputs that may be invisible to source review and SBOM inspection.
+
+\texttt{repx} addresses this gap by capturing process-level behavior at the kernel boundary and producing an attestation hash that can be checked later via re-execution. The project targets a core research question:
+\begin{quote}
+Can kernel-observed build behavior be canonicalized into a deterministic, verifiable process provenance commitment?
+\end{quote}
+
+The current implementation indicates that the answer is ``yes'' for a practical subset of build-relevant events on Linux.
+
+\section{Problem Formulation}
+Let a build run produce a time-ordered stream of observed runtime events
+\[
+E = (e_1, e_2, \dots, e_n),
+\]
+where each event is emitted from kernel tracepoints. The goal is to compute a canonical operation sequence
+\[
+C = \mathcal{N}(E),
+\]
+where $\mathcal{N}$ normalizes system-dependent details (for example, process IDs and some system-state reads), and then compute a commitment
+\[
+R = \mathcal{M}(C),
+\]
+where $\mathcal{M}$ is a Merkle-tree root over operation hashes.
+
+Two runs are considered behaviorally equivalent under this model if and only if they produce the same root $R$ after canonicalization. A mismatch indicates behavioral divergence and can be localized by descending divergent Merkle nodes.
+
+\section{System Overview}
+\texttt{repx} consists of three components:
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{eBPF collection layer} (kernel-space): captures selected tracepoints for open/close, mmap, exec, fork, and exit, scoped to a root process and descendants.
+  \item \textbf{Userspace tracer and canonicalizer}: resolves paths, associates file descriptors, computes content hashes, normalizes selected system-state accesses, and maps real PIDs to logical process indices.
+  \item \textbf{Attestation layer}: hashes canonical operations and builds a Merkle tree; emits a JSON attestation containing root hash, tree, and command metadata.
+\end{enumerate}
+
+Verification re-runs the command, recomputes the root, and reports either equality (verified) or divergence points (diagnostics).
+
+\section{What This Achieves Academically}
+\subsection{A Process-Centric Provenance Primitive}
+\texttt{repx} operationalizes ``Software Bill of Process'' style reasoning: provenance is derived from observed runtime behavior rather than declared intent. This shifts the measurement boundary from package metadata to kernel-observed execution, enabling investigation of attacks that manipulate build scripts, transient files, or process chains.
+
+\subsection{A Canonicalization Strategy for Reproducibility}
+The prototype contributes a concrete normalization pipeline:
+\begin{itemize}[leftmargin=*]
+  \item content hashing of file inputs/outputs rather than path-only identity,
+  \item normalization of selected host-state reads (for example, \texttt{/proc}, \texttt{/sys}) via sentinel values,
+  \item logical process indexing and root-process anchoring to reduce run-specific variance.
+\end{itemize}
+This is valuable as a reusable pattern for future provenance systems.
+
+\subsection{Commit-and-Diff Verifiability}
+The Merkle commitment provides two academic benefits:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{compact verification}: one root hash for equality checks,
+  \item \textbf{explainable failure}: subtree descent to isolate where runs diverged.
+\end{itemize}
+This combines cryptographic succinctness with operational diagnosability.
+
+\subsection{Integrity-Aware Handling of Telemetry Loss}
+The implementation tracks dropped ring-buffer events and distinguishes policy by mode:
+\begin{itemize}[leftmargin=*]
+  \item trace mode warns and still emits output,
+  \item verify mode fails closed on dropped events.
+\end{itemize}
+This explicit treatment of observability failure is a meaningful research property; many tracing systems silently degrade.
+
+\section{Threat Model and Security Semantics}
+\textbf{In-scope:} behavioral changes that alter traced process activity (extra writes, modified tool binaries, changed command paths, altered build scripts, new process chains, etc.).
+
+\textbf{Out-of-scope / partial:}
+\begin{itemize}[leftmargin=*]
+  \item attacks entirely outside traced event coverage,
+  \item kernel compromise (the monitor and measured environment are not independent),
+  \item races where \texttt{/proc}-based best-effort enrichments are unavailable,
+  \item semantics not yet encoded in canonicalization (for example, complete filesystem namespace resolution).
+\end{itemize}
+
+Therefore, the attestation is best interpreted as a \emph{deterministic commitment over observed covered behavior}, not a full proof of non-malicious execution.
+
+\section{Prototype Evidence}
+The repository includes integration scenarios demonstrating:
+\begin{enumerate}[leftmargin=*]
+  \item successful trace/verify consistency on deterministic C build workflows,
+  \item detection of process-level divergence in a script-tampering ``attack demo'' where hidden output is introduced.
+\end{enumerate}
+These are prototype-level case studies, not a statistically powered benchmark. Their research value is proof-of-feasibility for the process-attestation model.
+
+\section{Limitations (Important for Correct Interpretation)}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Platform scope:} Linux + eBPF, requiring elevated privileges/capabilities.
+  \item \textbf{Coverage scope:} only selected syscalls/tracepoints are modeled.
+  \item \textbf{Canonicalization assumptions:} some path and process metadata enrichment is best-effort.
+  \item \textbf{No formal proof yet:} the current guarantees are empirical and implementation-driven.
+  \item \textbf{No large-scale evaluation yet:} overhead and false-positive/negative behavior across diverse ecosystems remain open.
+\end{itemize}
+
+\section{Research Opportunities Enabled by repx}
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Formal semantics of canonicalization:} prove invariants and equivalence classes for reproducible runs.
+  \item \textbf{Coverage optimization:} identify minimal tracepoint sets that maximize attack detectability.
+  \item \textbf{Cross-host reproducibility studies:} quantify which host differences must be normalized.
+  \item \textbf{Compositional attestations:} combine process commitments with SBOM/in-toto/SLSA predicates.
+  \item \textbf{Adversarial evaluation:} systematically test evasion strategies against event coverage and normalization rules.
+\end{enumerate}
+
+\section{Conclusion}
+\texttt{repx} demonstrates a practical and academically relevant pattern: kernel-level execution traces can be transformed into deterministic, cryptographically verifiable process provenance. The strongest contribution is conceptual and methodological: a concrete pathway from runtime telemetry to reproducible attestations with divergence diagnostics. While the prototype has clear limitations, it provides a strong foundation for research on process-centric supply-chain integrity and reproducible build assurance.
+
+\begin{thebibliography}{9}
+
+\bibitem{merkle}
+R. C. Merkle.
+\newblock A Digital Signature Based on a Conventional Encryption Function.
+\newblock \emph{Advances in Cryptology---CRYPTO '87}, 1988.
+
+\bibitem{slsa}
+SLSA Authors.
+\newblock Supply-chain Levels for Software Artifacts (SLSA).
+\newblock \url{https://slsa.dev/}
+
+\bibitem{intoto}
+in-toto Authors.
+\newblock in-toto: A framework to secure the integrity of software supply chains.
+\newblock \url{https://in-toto.io/}
+
+\bibitem{ebpf}
+eBPF Foundation.
+\newblock What is eBPF?
+\newblock \url{https://ebpf.io/what-is-ebpf/}
+
+\end{thebibliography}
+
+\end{document}

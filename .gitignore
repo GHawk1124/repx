@@ -1,0 +1,16 @@
+# Build outputs
+/target
+/repx-ebpf/target
+*.o
+*.bpf.o
+result
+
+# LaTeX build artifacts
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+repx_paper.pdf
+
+# Attestation (generated/derived)
+attestation.json

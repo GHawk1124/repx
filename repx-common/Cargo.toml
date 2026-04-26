@@ -1,0 +1,13 @@
+[package]
+name = "repx-common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared types between repx eBPF probes and userspace"
+
+[features]
+default = []
+# When used from userspace code
+user = ["aya"]
+
+[dependencies]
+aya = { version = "0.13", optional = true }
