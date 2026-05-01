@@ -142,10 +142,16 @@ fn try_openat_enter(ctx: &TracePointContext) -> Result<u32, i64> {
 
     let tracked = is_tracked(tgid);
 
-    // sys_enter_openat format: __syscall_nr(8), dfd(8), filename(8), flags(8), mode(8)
-    let dfd: i32 = unsafe { ctx.read_at(8)? };
-    let filename_ptr: *const u8 = unsafe { ctx.read_at(16)? };
-    let flags: u32 = unsafe { ctx.read_at(24)? };
+    // sys_enter_openat layout (x86-64):
+    //   offset  0: common fields (8 bytes)
+    //   offset  8: __syscall_nr  (int, 4 bytes + 4 pad)
+    //   offset 16: dfd           (unsigned long, 8 bytes)
+    //   offset 24: filename      (pointer,       8 bytes)
+    //   offset 32: flags         (unsigned long, 8 bytes)
+    //   offset 40: mode          (umode_t,       2 bytes)
+    let dfd: i32 = unsafe { ctx.read_at(16)? };
+    let filename_ptr: *const u8 = unsafe { ctx.read_at(24)? };
+    let flags: u32 = unsafe { ctx.read_at(32)? };
 
     let mut stash = OpenatStash {
         dfd,
@@ -201,8 +207,8 @@ fn try_openat_exit(ctx: &TracePointContext) -> Result<u32, i64> {
     };
     let _ = OPENAT_STASH.remove(&pid_tgid);
 
-    // sys_exit_openat format: __syscall_nr(8), ret(8)
-    let ret: i64 = unsafe { ctx.read_at(8)? };
+    // sys_exit_openat: __syscall_nr at offset 8 (4+4 pad), ret at offset 16.
+    let ret: i64 = unsafe { ctx.read_at(16)? };
     let fd = ret as i32;
 
     // Skip failed opens (fd < 0).
@@ -254,8 +260,8 @@ fn try_close_enter(ctx: &TracePointContext) -> Result<u32, i64> {
     let tgid = (pid_tgid >> 32) as u32;
     let pid = pid_tgid as u32;
 
-    // sys_enter_close format: __syscall_nr(8), fd(8)
-    let fd: i32 = unsafe { ctx.read_at(8)? };
+    // sys_enter_close: __syscall_nr at offset 8 (4+4 pad), fd at offset 16.
+    let fd: i32 = unsafe { ctx.read_at(16)? };
 
     let source: u8;
     if is_tracked(tgid) {
@@ -307,10 +313,17 @@ fn try_mmap_enter(ctx: &TracePointContext) -> Result<u32, i64> {
     let tgid = (pid_tgid >> 32) as u32;
     let pid = pid_tgid as u32;
 
-    // sys_enter_mmap format: __syscall_nr(8), addr(8), len(8), prot(8), flags(8), fd(8), off(8)
-    let prot: u64 = unsafe { ctx.read_at(24)? };
-    let flags: u64 = unsafe { ctx.read_at(32)? };
-    let fd: i64 = unsafe { ctx.read_at(40)? };
+    // sys_enter_mmap layout (x86-64):
+    //   offset  8: __syscall_nr (int, 4+4 pad)
+    //   offset 16: addr  (unsigned long)
+    //   offset 24: len   (size_t)
+    //   offset 32: prot  (unsigned long)
+    //   offset 40: flags (unsigned long)
+    //   offset 48: fd    (unsigned long)
+    //   offset 56: off   (unsigned long)
+    let prot: u64 = unsafe { ctx.read_at(32)? };
+    let flags: u64 = unsafe { ctx.read_at(40)? };
+    let fd: i64 = unsafe { ctx.read_at(48)? };
 
     // Only care about file-backed mappings (fd >= 0).
     if fd < 0 {
@@ -430,13 +443,13 @@ pub fn repx_fork(ctx: TracePointContext) -> u32 {
 }
 
 fn try_fork(ctx: &TracePointContext) -> Result<u32, i64> {
-    // sched/sched_process_fork format:
-    // offset 0:  parent_comm (16 bytes)
-    // offset 16: parent_pid (u32)
-    // offset 20: child_comm (16 bytes)
-    // offset 36: child_pid (u32)
-    let parent_pid: u32 = unsafe { ctx.read_at(16)? };
-    let child_pid: u32 = unsafe { ctx.read_at(36)? };
+    // sched_process_fork layout:
+    //   offset  8: parent_comm[16] (char[16])
+    //   offset 24: parent_pid      (pid_t, 4 bytes)
+    //   offset 28: child_comm[16]  (char[16])
+    //   offset 44: child_pid       (pid_t, 4 bytes)
+    let parent_pid: u32 = unsafe { ctx.read_at(24)? };
+    let child_pid: u32 = unsafe { ctx.read_at(44)? };
 
     if !is_tracked(parent_pid) {
         return Ok(0);

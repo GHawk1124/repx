@@ -113,8 +113,13 @@ fn is_system_state(path: &str) -> bool {
         .any(|prefix| path.starts_with(prefix))
 }
 
-/// Hash the contents of a file. Returns None if the file can't be read.
+/// Hash the contents of a regular file. Returns None if the path is unreadable
+/// or is not a regular file (FIFOs, sockets, and devices would block on read).
 fn hash_file_contents(path: &str) -> Option<String> {
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
     let data = fs::read(path).ok()?;
     let hash = Sha256::digest(&data);
     Some(format!("sha256:{:x}", hash))
@@ -168,7 +173,6 @@ pub fn canonicalize_events(
             TracedEvent::Exec {
                 pid,
                 filename,
-                argv,
                 ..
             } => {
                 // Assign logical index if new.
@@ -184,18 +188,16 @@ pub fn canonicalize_events(
                     pid_to_tool_hash.insert(*pid, th.clone());
                 }
 
-                // Keep argv literally. File content is captured via
-                // FileOpen/FileClose events, so hashing argv paths here
-                // would be redundant and would cause non-determinism when
-                // the compiler produces output files (which are hashed at
-                // canonicalization time, after the build completes).
-                let args: Vec<String> = argv.iter().skip(1).cloned().collect();
-
+                // Argv is intentionally empty: BPF kernel-stack captures are
+                // racy (the same exec yields different argv across runs) and
+                // gcc emits random temp paths (/tmp/ccXXXXXX.s) into argv,
+                // both breaking determinism. Build identity is captured via
+                // tool_hash plus FileOpen/Close content hashes.
                 ops.push(CanonicalOp {
                     op_type: OpType::Exec,
                     process_index: proc_idx,
                     tool_hash,
-                    args,
+                    args: vec![],
                     input_hashes: vec![],
                     output_hashes: vec![],
                 });

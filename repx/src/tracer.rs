@@ -6,8 +6,12 @@ use aya::maps::{HashMap as BpfHashMap, RingBuf};
 use aya::programs::TracePoint;
 use aya::Ebpf;
 use log::{debug, info, warn};
+use nix::sys::signal::{kill, Signal};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use nix::unistd::{execvp, fork, ForkResult, Pid};
 use repx_common::{Event, EventKind, WatchedPrefix, MAX_PREFIX_LEN, MAX_WATCH_PREFIXES};
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::path::PathBuf;
 
 /// AT_FDCWD sentinel: openat interprets relative paths against the cwd.
@@ -111,13 +115,8 @@ pub fn trace_command(command: &[String], watch_dirs: &[PathBuf]) -> Result<Trace
         }
     }
 
-    // Spawn the command and track its PID.
-    let child = std::process::Command::new(&command[0])
-        .args(&command[1..])
-        .spawn()
-        .with_context(|| format!("Failed to spawn: {}", command[0]))?;
-
-    let child_pid = child.id();
+    let root_binary = resolve_executable(&command[0]);
+    let child_pid = spawn_suspended(command)?;
     info!("Tracing PID {} ({})", child_pid, command[0]);
 
     // Register the child PID for tracking in the BPF maps.
@@ -131,6 +130,9 @@ pub fn trace_command(command: &[String], watch_dirs: &[PathBuf]) -> Result<Trace
         tracked.insert(child_pid, 1u8, 0)?;
     }
 
+    kill(Pid::from_raw(child_pid as i32), Signal::SIGCONT)
+        .with_context(|| format!("Failed to resume traced child {}", child_pid))?;
+
     // Consume events from the ring buffer until the child exits.
     let mut events = Vec::new();
     let ring_buf = RingBuf::try_from(bpf.map_mut("EVENTS").unwrap())?;
@@ -138,7 +140,21 @@ pub fn trace_command(command: &[String], watch_dirs: &[PathBuf]) -> Result<Trace
     // Track fd -> path mapping per process for resolving closes.
     let mut fd_table: HashMap<(u32, i32), String> = HashMap::new();
 
-    collect_events(ring_buf, child, child_pid, &mut events, &mut fd_table)?;
+    collect_events(ring_buf, child_pid, &mut events, &mut fd_table)?;
+
+    // Use a single userspace-authored root Exec op. This avoids the original
+    // spawn-to-map-registration race and prevents duplicate root Exec ops when
+    // BPF also observes sched_process_exec.
+    events.retain(|ev| !matches!(ev, TracedEvent::Exec { pid, .. } if *pid == child_pid));
+    events.insert(
+        0,
+        TracedEvent::Exec {
+            pid: child_pid,
+            ppid: std::process::id(),
+            filename: root_binary,
+            argv: command.to_vec(),
+        },
+    );
 
     // Check for dropped events (ring buffer was full).
     let dropped_events = {
@@ -171,6 +187,58 @@ fn attach_tracepoint(bpf: &mut Ebpf, prog_name: &str, category: &str, name: &str
         .with_context(|| format!("Failed to attach {} to {}/{}", prog_name, category, name))?;
     info!("Attached {}/{}", category, name);
     Ok(())
+}
+
+fn spawn_suspended(command: &[String]) -> Result<u32> {
+    let argv: Vec<CString> = command
+        .iter()
+        .map(|arg| CString::new(arg.as_str()))
+        .collect::<std::result::Result<_, _>>()
+        .context("Command contains an interior NUL byte")?;
+
+    let child = match unsafe { fork() }.context("Failed to fork traced child")? {
+        ForkResult::Child => {
+            let _ = kill(Pid::this(), Signal::SIGSTOP);
+            let _ = execvp(&argv[0], &argv);
+            unsafe { nix::libc::_exit(127) };
+        }
+        ForkResult::Parent { child } => child,
+    };
+
+    loop {
+        match waitpid(child, Some(WaitPidFlag::WUNTRACED))
+            .with_context(|| format!("Failed waiting for traced child {}", child))?
+        {
+            WaitStatus::Stopped(_, Signal::SIGSTOP) => return Ok(child.as_raw() as u32),
+            WaitStatus::Exited(_, code) => {
+                anyhow::bail!("Traced child exited before exec with status {}", code);
+            }
+            WaitStatus::Signaled(_, signal, _) => {
+                anyhow::bail!("Traced child died before exec from signal {}", signal);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn resolve_executable(command: &str) -> String {
+    if command.contains('/') {
+        return std::fs::canonicalize(command)
+            .unwrap_or_else(|_| PathBuf::from(command))
+            .to_string_lossy()
+            .into_owned();
+    }
+
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(command);
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    command.to_string()
 }
 
 fn process_event(
@@ -320,13 +388,10 @@ fn process_event(
 
 fn collect_events(
     mut ring_buf: RingBuf<&mut aya::maps::MapData>,
-    child: std::process::Child,
     child_pid: u32,
     events: &mut Vec<TracedEvent>,
     fd_table: &mut HashMap<(u32, i32), String>,
 ) -> Result<()> {
-    let mut child = child;
-
     loop {
         // Poll the ring buffer.
         while let Some(item) = ring_buf.next() {
@@ -341,68 +406,99 @@ fn collect_events(
         }
 
         // Check if the child has exited.
-        match child.try_wait()? {
-            Some(status) => {
-                info!("Child exited with: {}", status);
-
-                // Allow a short quiescence window for sibling watch-mode
-                // events that race with the traced child's exit.
-                let quiescence = std::time::Duration::from_millis(100);
-                let poll_interval = std::time::Duration::from_millis(10);
-                let mut deadline = std::time::Instant::now() + quiescence;
-
-                loop {
-                    let mut saw_event = false;
-
-                    while let Some(item) = ring_buf.next() {
-                        let data = item.as_ref();
-                        if data.len() >= std::mem::size_of::<Event>() {
-                            let event: &Event = unsafe { &*(data.as_ptr() as *const Event) };
-                            process_event(event, events, fd_table);
-                            saw_event = true;
-                        }
-                    }
-
-                    if saw_event {
-                        deadline = std::time::Instant::now() + quiescence;
-                    }
-
-                    if std::time::Instant::now() >= deadline {
-                        break;
-                    }
-
-                    std::thread::sleep(poll_interval);
-                }
-
-                // Patch the child's exit event with the real exit code from wait().
-                // BPF can't reliably read exit_code from task_struct, so we
-                // use the waitpid result which is authoritative.
-                let real_exit_code = status.code().unwrap_or(-1);
-                let mut found_exit = false;
-                for ev in events.iter_mut().rev() {
-                    if let TracedEvent::Exit { pid, exit_code, .. } = ev {
-                        if *pid == child_pid {
-                            *exit_code = real_exit_code;
-                            found_exit = true;
-                            break;
-                        }
-                    }
-                }
-
-                // If BPF missed the exit event (race), synthesize one.
-                if !found_exit {
-                    events.push(TracedEvent::Exit {
-                        pid: child_pid,
-                        exit_code: real_exit_code,
-                    });
-                }
-
+        match waitpid(
+            Pid::from_raw(child_pid as i32),
+            Some(WaitPidFlag::WNOHANG),
+        )? {
+            WaitStatus::Exited(_, real_exit_code) => {
+                info!("Child exited with status {}", real_exit_code);
+                finish_child_exit(
+                    ring_buf,
+                    child_pid,
+                    real_exit_code,
+                    events,
+                    fd_table,
+                )?;
                 break;
             }
-            None => {
+            WaitStatus::Signaled(_, signal, _) => {
+                let real_exit_code = 128 + signal as i32;
+                info!("Child exited from signal {}", signal);
+                finish_child_exit(
+                    ring_buf,
+                    child_pid,
+                    real_exit_code,
+                    events,
+                    fd_table,
+                )?;
+                break;
+            }
+            WaitStatus::StillAlive => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
+            _ => {}
         }
+    }
+
+    Ok(())
+}
+
+fn finish_child_exit(
+    mut ring_buf: RingBuf<&mut aya::maps::MapData>,
+    child_pid: u32,
+    real_exit_code: i32,
+    events: &mut Vec<TracedEvent>,
+    fd_table: &mut HashMap<(u32, i32), String>,
+) -> Result<()> {
+    // Allow a short quiescence window for sibling watch-mode events that race
+    // with the traced child's exit.
+    let quiescence = std::time::Duration::from_millis(100);
+    let poll_interval = std::time::Duration::from_millis(10);
+    let mut deadline = std::time::Instant::now() + quiescence;
+
+    loop {
+        let mut saw_event = false;
+
+        while let Some(item) = ring_buf.next() {
+            let data = item.as_ref();
+            if data.len() >= std::mem::size_of::<Event>() {
+                let event: &Event = unsafe { &*(data.as_ptr() as *const Event) };
+                process_event(event, events, fd_table);
+                saw_event = true;
+            }
+        }
+
+        if saw_event {
+            deadline = std::time::Instant::now() + quiescence;
+        }
+
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+
+        std::thread::sleep(poll_interval);
+    }
+
+    // Patch the child's exit event with the real exit code from waitpid().
+    // BPF can't reliably read exit_code from task_struct, so we use waitpid,
+    // which is authoritative.
+    let mut found_exit = false;
+    for ev in events.iter_mut().rev() {
+        if let TracedEvent::Exit { pid, exit_code, .. } = ev {
+            if *pid == child_pid {
+                *exit_code = real_exit_code;
+                found_exit = true;
+                break;
+            }
+        }
+    }
+
+    // If BPF missed the exit event, synthesize one.
+    if !found_exit {
+        events.push(TracedEvent::Exit {
+            pid: child_pid,
+            exit_code: real_exit_code,
+        });
     }
 
     Ok(())
