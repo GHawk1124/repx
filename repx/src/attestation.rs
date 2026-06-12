@@ -84,8 +84,8 @@ impl Attestation {
         let root_hash = commitment_hash(&process_root, command, &output_selection, &outputs);
 
         Attestation {
-            version: "0.2.0".to_string(),
-            predicate_type: "https://repx.dev/process-provenance/v0.2".to_string(),
+            version: "0.2.1".to_string(),
+            predicate_type: "https://repx.dev/process-provenance/v0.2.1".to_string(),
             root_hash,
             process_root,
             command: command.to_vec(),
@@ -119,7 +119,7 @@ impl Attestation {
                 }
                 self.process_root = derived_process_root;
             }
-            "0.2.0" => {
+            "0.2.0" | "0.2.1" => {
                 if self.process_root.is_empty() {
                     self.process_root = derived_process_root.clone();
                 }
@@ -164,8 +164,9 @@ fn commitment_hash(
         output_selection,
         outputs,
     };
-    // This exact compact JSON field order is part of the v0.2 commitment
-    // format. A future canonical encoding must use a new attestation version.
+    // This exact compact JSON field order is part of the v0.2.x commitment
+    // format. A future canonical encoding (JCS or length-prefixed framing)
+    // must use a new attestation version.
     let encoded = serde_json::to_vec(&commitment).expect("serializing commitment cannot fail");
     let hash = Sha256::digest(encoded);
     format!("sha256:{:x}", hash)
@@ -246,6 +247,18 @@ mod tests {
         );
         attestation.version = "0.3.0".to_string();
         assert!(attestation.validate().is_err());
+    }
+
+    #[test]
+    fn v0_2_1_attestations_pass_validation() {
+        let mut attestation = Attestation::new_with_outputs(
+            tree(),
+            &["true".to_string()],
+            OutputSelection::default(),
+            Vec::new(),
+        );
+        assert_eq!(attestation.version, "0.2.1");
+        assert!(attestation.validate().is_ok());
     }
 
     #[test]

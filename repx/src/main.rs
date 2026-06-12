@@ -1,6 +1,7 @@
 mod attestation;
 mod canonicalize;
 mod file_identity;
+mod harness;
 mod merkle;
 mod slice;
 mod stability;
@@ -115,6 +116,41 @@ enum Commands {
         /// Exit unsuccessfully unless every attestation root matches.
         #[arg(long)]
         strict: bool,
+    },
+
+    /// Run a command N times and report attestation-root stability.
+    Harness {
+        /// Number of repeated traces (minimum 2).
+        #[arg(short, long, default_value = "20")]
+        runs: usize,
+
+        /// Output path for the JSON stability report (default: stdout).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Directory to store per-run attestations.
+        #[arg(long = "attestation-dir", value_name = "DIR", default_value = "repx-harness-output")]
+        attestation_dir: PathBuf,
+
+        /// Directories to monitor system-wide.
+        #[arg(short, long = "watch", value_name = "DIR")]
+        watch_dirs: Vec<PathBuf>,
+
+        /// Explicit artifact file to attest. May be repeated.
+        #[arg(long = "artifact", value_name = "PATH")]
+        artifacts: Vec<PathBuf>,
+
+        /// Directory whose changed files should be attested. May be repeated.
+        #[arg(long = "output-root", value_name = "DIR")]
+        output_roots: Vec<PathBuf>,
+
+        /// Produce attestations even if the eBPF ring dropped events.
+        #[arg(long)]
+        allow_dropped_events: bool,
+
+        /// The command to trace (everything after --).
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
     },
 }
 
@@ -355,6 +391,35 @@ fn main() -> Result<()> {
 
             if strict && report.root_matches != report.run_count {
                 std::process::exit(1);
+            }
+            Ok(())
+        }
+        Commands::Harness {
+            runs,
+            output,
+            attestation_dir,
+            watch_dirs,
+            artifacts,
+            output_roots,
+            allow_dropped_events,
+            command,
+        } => {
+            let config = harness::HarnessConfig {
+                runs,
+                watch_dirs,
+                artifacts,
+                output_roots,
+                allow_dropped_events,
+                command,
+                output_dir: Some(attestation_dir),
+            };
+
+            if let Some(ref report_path) = output {
+                let mut file = std::fs::File::create(report_path)?;
+                harness::run_harness(&config, &mut file)?;
+                println!("Report written to: {}", report_path.display());
+            } else {
+                harness::run_harness(&config, &mut std::io::stdout())?;
             }
             Ok(())
         }

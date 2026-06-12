@@ -931,9 +931,12 @@ fn try_exit(_ctx: &TracePointContext) -> Result<u32, i64> {
         return Ok(0);
     }
 
-    // sched_process_exit fires for every thread. Process lifetimes end only
-    // when the thread-group leader exits.
+    // sched_process_exit fires for every thread. Thread PIDs are untracked
+    // immediately to prevent stale entries that could match a recycled PID
+    // assigned later as an unrelated tgid. Process lifetimes end only when
+    // the thread-group leader exits.
     if pid != tgid {
+        untrack_pid(pid);
         return Ok(0);
     }
 
