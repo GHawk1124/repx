@@ -424,21 +424,12 @@ fn process_event(
             let payload = unsafe { &event.payload.file_open };
             let external = event.source == 1;
             let process_id = payload.tgid;
+            let process = state.current_process(process_id);
             let path_len = (payload.path_len as usize).min(payload.path.len());
             let raw_path = std::str::from_utf8(&payload.path[..path_len])
                 .unwrap_or("<invalid utf8>")
                 .trim_end_matches('\0')
                 .to_string();
-            let can_write = (payload.flags & 0x3) != 0;
-            eprintln!(
-                "DEBUG FileOpen raw: tgid={} fd={} flags={:#x} can_write={} path={} external={}",
-                process_id, payload.fd, payload.flags, can_write, raw_path, external
-            );
-            let process = state.current_process(process_id);
-            eprintln!(
-                "DEBUG FileOpen resolved: process=(pid={}, gen={})",
-                process.lifetime.pid, process.lifetime.generation
-            );
 
             let raw_resolved = state.resolve_path(process, payload.dfd, &raw_path);
             let proc_fd_path = format!("/proc/{}/fd/{}", payload.tgid, payload.fd);
@@ -737,18 +728,7 @@ fn process_event(
         }
         EventKind::ProcessFork => {
             let payload = unsafe { &event.payload.process_fork };
-            eprintln!(
-                "DEBUG ProcessFork raw: parent_pid={} child_pid={}",
-                payload.parent_pid, payload.child_pid
-            );
             let (parent, child) = state.fork_process(payload.parent_pid, payload.child_pid);
-            eprintln!(
-                "DEBUG ProcessFork resolved: parent=(pid={}, gen={}) child=(pid={}, gen={})",
-                parent.lifetime.pid,
-                parent.lifetime.generation,
-                child.lifetime.pid,
-                child.lifetime.generation
-            );
             debug!(
                 "Fork parent={} generation={} epoch={} child={} generation={}",
                 parent.lifetime.pid,
@@ -810,30 +790,16 @@ fn process_buffered_events(
     state: &mut EventCollectorState,
     watch_prefixes: &[String],
 ) {
-    let mut raw_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (_, data) in raw_events {
         if data.len() < std::mem::size_of::<Event>() {
             state.malformed_events = state.malformed_events.saturating_add(1);
             continue;
         }
         let event = unsafe { (data.as_ptr() as *const Event).read_unaligned() };
-        let kind_str = match EventKind::try_from(event.kind) {
-            Ok(k) => format!("{:?}", k),
-            Err(_) => format!("unknown({})", event.kind),
-        };
-        let src_str = if event.source == 0 { "tracked" } else { "watch" };
-        *raw_counts.entry(format!("{}/{}", kind_str, src_str)).or_default() += 1;
         if !process_event(&event, events, state, watch_prefixes) {
             state.malformed_events = state.malformed_events.saturating_add(1);
         }
     }
-    eprintln!("DEBUG TRACER raw event counts: {:?}", raw_counts);
-    eprintln!(
-        "DEBUG TRACER traced events: {} total, {} fd_table entries left, {} processes tracked",
-        events.len(),
-        state.fd_table.len(),
-        state.current_processes.len(),
-    );
 }
 
 fn collect_events(

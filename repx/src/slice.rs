@@ -84,10 +84,6 @@ pub fn canonicalize_output_slice(
                     }
                 }
                 if can_write {
-                    eprintln!(
-                        "DEBUG SLICE FileOpen write: process=(pid={}, gen={}) fd={} path={} flags={:#x}",
-                        process.lifetime.pid, process.lifetime.generation, fd, path, flags
-                    );
                     pending_writes.insert((process.lifetime, fd), PendingWrite { process, path });
                 }
             }
@@ -134,17 +130,8 @@ pub fn canonicalize_output_slice(
                 }
 
                 let pending_write = pending_writes.remove(&(process.lifetime, fd));
-                eprintln!(
-                    "DEBUG SLICE FileClose: process=(pid={}, gen={}) fd={} has_pending={} has_obs={} path={:?}",
-                    process.lifetime.pid, process.lifetime.generation, fd,
-                    pending_write.is_some(), observation.is_some(), path
-                );
                 if let (Some(pending_write), Some(observation)) = (pending_write, observation) {
                     let path = path.unwrap_or(pending_write.path);
-                    eprintln!(
-                        "DEBUG SLICE FileClose WRITER: path={} process=(pid={}, gen={})",
-                        path, pending_write.process.lifetime.pid, pending_write.process.lifetime.generation
-                    );
                     writers_by_path
                         .entry(path)
                         .or_default()
@@ -244,17 +231,6 @@ pub fn canonicalize_output_slice(
         }
     }
 
-    eprintln!(
-        "DEBUG SLICE post-scan: wbp={} wbh={} flows={} pending_writes_left={}",
-        writers_by_path.len(),
-        writers_by_hash.len(),
-        flows.len(),
-        pending_writes.len(),
-    );
-    for (path, writers) in &writers_by_path {
-        eprintln!("DEBUG SLICE   wbp['{}'] = {} writer(s)", path, writers.len());
-    }
-
     if output_hashes.is_empty() {
         return Ok(Vec::new());
     }
@@ -270,11 +246,6 @@ pub fn canonicalize_output_slice(
                     queue.push_back(*process);
                 }
             }
-        } else {
-            eprintln!(
-                "DEBUG BFS: output path not in writers_by_path: {}",
-                output.path,
-            );
         }
     }
 
@@ -403,33 +374,6 @@ pub fn canonicalize_output_slice(
             }
         }
         if !attributed {
-            eprintln!(
-                "DEBUG orphan: hash={} in_wh={} wbp={} out_paths={:?}",
-                orphan_hash,
-                writers_by_hash.contains_key(&orphan_hash),
-                writers_by_path.len(),
-                outputs.iter().map(|o| &o.path).collect::<Vec<_>>(),
-            );
-            // Log matching paths in writers_by_path
-            for output in outputs {
-                eprintln!(
-                    "DEBUG output path={} (exists in wbp: {})",
-                    output.path,
-                    writers_by_path.contains_key(&output.path),
-                );
-                for (wbp_path, writers) in &writers_by_path {
-                    if wbp_path.ends_with(&output.path)
-                        || output.path.ends_with(wbp_path)
-                        || wbp_path == &output.path
-                    {
-                        eprintln!(
-                            "DEBUG   wbp['{}'] = {} writer(s)",
-                            wbp_path,
-                            writers.len(),
-                        );
-                    }
-                }
-            }
             ops.push(CanonicalOp {
                 op_type: OpType::FileWrite,
                 process_index: u32::MAX,
