@@ -173,11 +173,15 @@ fn main() -> Result<()> {
             }
 
             let canonical = if selected_outputs.outputs.is_empty() {
-                canonicalize::canonicalize_events(result.events, result.root_pid, &watch_prefixes)?
+                canonicalize::canonicalize_events(
+                    result.events,
+                    result.root_process,
+                    &watch_prefixes,
+                )?
             } else {
                 slice::canonicalize_output_slice(
                     result.events,
-                    result.root_pid,
+                    result.root_process,
                     &selected_outputs.outputs,
                 )?
             };
@@ -272,11 +276,15 @@ fn main() -> Result<()> {
             }
 
             let canonical = if selected_outputs.outputs.is_empty() {
-                canonicalize::canonicalize_events(result.events, result.root_pid, &watch_prefixes)?
+                canonicalize::canonicalize_events(
+                    result.events,
+                    result.root_process,
+                    &watch_prefixes,
+                )?
             } else {
                 slice::canonicalize_output_slice(
                     result.events,
-                    result.root_pid,
+                    result.root_process,
                     &selected_outputs.outputs,
                 )?
             };

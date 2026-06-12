@@ -41,6 +41,9 @@ project's integration workload matrix.
 
 - File reads, tool binaries, mmap inputs, and close-time outputs are hashed when their events reach userspace. Only regular files are opened, using nonblocking handles; retained handles allow deleted temporary files to remain hashable.
 - `O_RDWR` contributes both a read and a write. Writable private mappings are reads; only writable `MAP_SHARED` mappings are classified as file writes.
+- Process attribution uses a PID-reuse-safe lifetime plus an exec epoch. Forked children inherit the active tool identity and open-descriptor state; a later exec creates a distinct process instance.
+- Relative paths use a per-process working-directory cache inherited across fork, allowing short-lived processes to retain stable final-path attribution after their `/proc` entries disappear. Unobserved `chdir` changes remain best-effort.
+- Go `importcfg` control files are parsed and their random `go-build<digits>` work-root prefixes are canonicalized. Dependency names, work-relative layout, stable paths, and all other control-file data remain committed.
 - Canonicalization produces a sorted set of distinct covered operations. Counts, ordering, timestamps, and process indices are diagnostic data, not part of the process-set root.
 - Output-rooted attestations commit selected outputs and content-resolved dependencies. Unavailable transient intermediates remain visible in full-trace mode but are omitted from the output dependency walk. Missing, unreadable, and non-regular identities bind stable paths while normalizing recognized session and compiler temporary names.
 - The top-level root binds the process-set root, command, output selection, and output hashes.
@@ -55,7 +58,7 @@ project's integration workload matrix.
 | `openat`, `close`, file-backed `mmap`, `rename*`, `unlink*`, `exec`, fork, exit | Covered |
 | `open`, `openat2` | Not covered |
 | Temp-file replacement | Final rename paths are attributed; rename and deletion are distinct operations |
-| `dup*`, inherited descriptors | Descriptor attribution incomplete |
+| `dup*`, inherited descriptors | Fork-inherited descriptors are tracked; `dup*` remains incomplete |
 | `sendfile`, `copy_file_range`, `io_uring` | Not covered |
 | Network I/O and remote inputs | Not covered |
 | External relative-path reads in `--watch` mode | May be missed by kernel prefix filtering |

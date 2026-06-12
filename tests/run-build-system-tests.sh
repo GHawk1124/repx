@@ -76,17 +76,27 @@ blank_file_ops = sum(
     for op in ops
     if op["op_type"] in ("FileRead", "FileWrite") and not op.get("tool_hash")
 )
+orphan_outputs = sum(
+    1
+    for op in ops
+    if op["op_type"] == "FileWrite"
+    and op.get("process_index") == 4294967295
+    and "output" in op.get("args", [])
+)
 
 print(f"Canonical ops: {len(ops)}")
 for key in sorted(counts):
     print(f"  {key}: {counts[key]}")
 print(f"Unique tool hashes: {len(tool_hashes)}")
 print(f"File ops without tool hash: {blank_file_ops}")
+print(f"Unattributed selected outputs: {orphan_outputs}")
 
 if counts.get("FileWrite", 0) < 1:
     raise SystemExit("expected at least one exported output")
 if counts.get("Exit", 0) != 1:
     raise SystemExit("expected exactly one root exit")
+if orphan_outputs:
+    raise SystemExit("selected output was not attributed to a covered writer")
 PYEOF
 }
 
@@ -293,8 +303,14 @@ EOF
 setup_go() {
     local workspace="$TMPDIR/go"
     local gocache="$TMPDIR/go-cache"
+    local gocache_baseline="$TMPDIR/go-cache-baseline"
     local gomodcache="$TMPDIR/go-mod-cache"
-    mkdir -p "$workspace" "$gocache" "$gomodcache"
+    local gotmpdir="$TMPDIR/go-tmp"
+    mkdir -p "$workspace" "$gocache" "$gomodcache" "$gotmpdir"
+
+    # Go writes compiler control files containing its temporary build path.
+    # Keep that path fixed and reset its contents so repeated traces start
+    # from the same state and produce byte-identical generated inputs.
 
     cat > "$workspace/go.mod" << 'EOF'
 module example.com/repx-go-test
@@ -317,17 +333,20 @@ EOF
 
     (
         cd "$workspace"
-        GOCACHE="$gocache" GOMODCACHE="$gomodcache" \
+        mkdir -p dist
+        GOCACHE="$gocache" GOMODCACHE="$gomodcache" GOTMPDIR="$gotmpdir" \
             go build -trimpath -buildvcs=false -ldflags='-buildid=' \
-            -o "$TMPDIR/go-warm" .
+            -o dist/hello .
+        rm -rf dist "$gotmpdir"
     )
+    cp -a "$gocache" "$gocache_baseline"
 
     run_repx_case \
         "go" \
         "$workspace" \
-        "GOCACHE='$gocache' GOMODCACHE='$gomodcache' go build -trimpath -buildvcs=false -ldflags='-buildid=' -o dist/hello ." \
+        "GOCACHE='$gocache' GOMODCACHE='$gomodcache' GOTMPDIR='$gotmpdir' go build -trimpath -buildvcs=false -ldflags='-buildid=' -o dist/hello ." \
         "test \"\$(./dist/hello)\" = 'go add=13 multiply=42'" \
-        "rm -rf dist"
+        "rm -rf dist '$gocache' '$gotmpdir' && cp -a '$gocache_baseline' '$gocache' && mkdir -p '$gotmpdir'"
 }
 
 if [ "$#" -eq 0 ]; then

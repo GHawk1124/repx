@@ -35,6 +35,8 @@ pub enum EventKind {
     FileRenameDestination = 7,
     /// A path was successfully unlinked.
     FileUnlink = 8,
+    /// A tracked process created a child process.
+    ProcessFork = 9,
 }
 
 impl TryFrom<u32> for EventKind {
@@ -50,6 +52,7 @@ impl TryFrom<u32> for EventKind {
             6 => Ok(Self::FileRenameSource),
             7 => Ok(Self::FileRenameDestination),
             8 => Ok(Self::FileUnlink),
+            9 => Ok(Self::ProcessFork),
             _ => Err(()),
         }
     }
@@ -111,6 +114,14 @@ pub struct ProcessExitEvent {
     pub tgid: u32,
     /// Exit code.
     pub exit_code: i32,
+}
+
+/// Event emitted when a tracked process forks a child.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProcessForkEvent {
+    pub parent_pid: u32,
+    pub child_pid: u32,
 }
 
 /// Event emitted when a file is memory-mapped via mmap.
@@ -184,6 +195,7 @@ pub union EventPayload {
     pub file_path: FilePathEvent,
     pub process_exec: ProcessExecEvent,
     pub process_exit: ProcessExitEvent,
+    pub process_fork: ProcessForkEvent,
     pub _pad: [u8; core::mem::size_of::<FileOpenEvent>()],
 }
 
@@ -199,6 +211,7 @@ mod tests {
     #[test]
     fn unknown_event_kinds_are_rejected() {
         assert_eq!(EventKind::try_from(3), Ok(EventKind::ProcessExec));
+        assert_eq!(EventKind::try_from(9), Ok(EventKind::ProcessFork));
         assert!(EventKind::try_from(u32::MAX).is_err());
     }
 }

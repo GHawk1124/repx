@@ -51,7 +51,7 @@ Two runs are equivalent under this model if and only if they produce the same to
 \texttt{repx} consists of three components:
 \begin{enumerate}
   \item \textbf{eBPF collection layer} (kernel-space): captures selected tracepoints for open/close, mmap, exec, fork, and exit, scoped to a root process and descendants.
-  \item \textbf{Userspace tracer and canonicalizer}: resolves successful opens through \texttt{/proc/<pid>/fd}, validates resolved targets against captured paths, retains nonblocking regular-file handles when possible, filters external watch events before observation, hashes file identity as events arrive, normalizes selected system-state accesses, and maps real PIDs to diagnostic logical indices.
+  \item \textbf{Userspace tracer and canonicalizer}: resolves successful opens through \texttt{/proc/<pid>/fd}, validates resolved targets against captured paths, retains nonblocking regular-file handles when possible, caches per-process working directories across fork for short-lived relative-path operations, filters external watch events before observation, hashes file identity as events arrive, normalizes selected system-state accesses, and attributes operations to PID-reuse-safe process lifetimes and exec epochs before assigning diagnostic logical indices.
   \item \textbf{Attestation layer}: hashes canonical operations and builds a Merkle tree; emits a JSON attestation containing the sorted leaves plus a root that binds the command and output policy.
 \end{enumerate}
 
@@ -66,8 +66,10 @@ The prototype contributes a concrete normalization pipeline:
 \begin{itemize}
   \item event-arrival hashing of file inputs/outputs rather than end-of-run path hashing,
   \item unavailable identities that distinguish missing, unreadable, and non-regular files, bind stable paths, and normalize recognized session/compiler temporary names,
+  \item structured normalization of Go import-configuration files that replaces only randomized \texttt{go-build<digits>} work-root prefixes while retaining dependency names, relative layout, and other control data,
   \item output-rooted slicing that commits selected output hashes and content-resolved dependencies while omitting unavailable transient intermediates from the dependency walk,
   \item normalization of selected host-state reads (for example, \texttt{/proc}, \texttt{/sys}) via sentinel values,
+  \item fork-aware process-instance identity: each process lifetime carries an exec epoch, children inherit tool and descriptor state, and PID reuse starts a new generation,
   \item logical process indexing and root-process anchoring to reduce run-specific variance.
 \end{itemize}
 This is valuable as a reusable pattern for future provenance systems.

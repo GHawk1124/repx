@@ -17,21 +17,58 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use crate::file_identity::{
-    is_path_within, observe_file, observe_path, open_regular, FileObservation,
+    is_path_within, observe_file, observe_path, open_regular, FileObservation, EMPTY_CONTENT_HASH,
 };
 
 /// AT_FDCWD sentinel: openat interprets relative paths against the cwd.
 const AT_FDCWD: i32 = -100;
 
+/// One kernel process lifetime. The generation distinguishes PID reuse within
+/// a trace without making scheduler-assigned values part of the commitment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProcessLifetime {
+    pub pid: u32,
+    pub generation: u32,
+}
+
+/// A specific executable image within a process lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProcessInstance {
+    pub lifetime: ProcessLifetime,
+    pub exec_epoch: u32,
+}
+
+impl ProcessInstance {
+    #[cfg(test)]
+    pub const fn test(pid: u32) -> Self {
+        Self {
+            lifetime: ProcessLifetime { pid, generation: 0 },
+            exec_epoch: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub const fn test_epoch(pid: u32, exec_epoch: u32) -> Self {
+        Self {
+            lifetime: ProcessLifetime { pid, generation: 0 },
+            exec_epoch,
+        }
+    }
+}
+
 /// A high-level traced event, extracted from raw BPF events.
 #[derive(Debug, Clone)]
 pub enum TracedEvent {
     Exec {
-        pid: u32,
+        process: ProcessInstance,
         observation: FileObservation,
     },
+    Fork {
+        parent: ProcessInstance,
+        child: ProcessInstance,
+    },
     FileOpen {
-        pid: u32,
+        process: ProcessInstance,
         path: String,
         flags: u32,
         fd: i32,
@@ -41,7 +78,7 @@ pub enum TracedEvent {
         observation: FileObservation,
     },
     FileClose {
-        pid: u32,
+        process: ProcessInstance,
         fd: i32,
         /// Resolved path (looked up from our fd tracking table).
         path: Option<String>,
@@ -51,7 +88,7 @@ pub enum TracedEvent {
         observation: Option<FileObservation>,
     },
     FileMmap {
-        pid: u32,
+        process: ProcessInstance,
         fd: i32,
         prot: u32,
         flags: u32,
@@ -63,7 +100,7 @@ pub enum TracedEvent {
         observation: Option<FileObservation>,
     },
     FileRename {
-        pid: u32,
+        process: ProcessInstance,
         from_path: String,
         to_path: String,
         flags: u32,
@@ -73,7 +110,7 @@ pub enum TracedEvent {
         observation: FileObservation,
     },
     FileUnlink {
-        pid: u32,
+        process: ProcessInstance,
         path: String,
         flags: u32,
         /// True if this event came from a non-fork-tree process.
@@ -82,7 +119,7 @@ pub enum TracedEvent {
         observation: FileObservation,
     },
     Exit {
-        pid: u32,
+        process: ProcessInstance,
         exit_code: i32,
     },
 }
@@ -90,8 +127,8 @@ pub enum TracedEvent {
 /// Result of tracing a command.
 pub struct TraceResult {
     pub events: Vec<TracedEvent>,
-    /// PID of the root traced process.
-    pub root_pid: u32,
+    /// Initial executable image of the root traced process.
+    pub root_process: ProcessInstance,
     /// Number of events dropped due to ring buffer overflow (0 = lossless).
     pub dropped_events: u64,
 }
@@ -222,6 +259,7 @@ pub fn trace_command(command: &[String], watch_dirs: &[PathBuf]) -> Result<Trace
 
     let root_binary = resolve_executable(&command[0]);
     let root_observation = observe_path(&root_binary);
+    let root_cwd = std::env::current_dir().context("Failed to resolve trace working directory")?;
     let child_pid = spawn_suspended(command)?;
     info!("Tracing PID {} ({})", child_pid, command[0]);
 
@@ -244,7 +282,8 @@ pub fn trace_command(command: &[String], watch_dirs: &[PathBuf]) -> Result<Trace
     let ring_buf = RingBuf::try_from(bpf.map_mut("EVENTS").unwrap())?;
 
     // Track fd -> path mapping per process for resolving closes.
-    let mut collector_state = EventCollectorState::default();
+    let mut collector_state = EventCollectorState::new(child_pid, root_cwd);
+    let root_process = collector_state.root_process;
 
     collect_events(
         ring_buf,
@@ -254,14 +293,13 @@ pub fn trace_command(command: &[String], watch_dirs: &[PathBuf]) -> Result<Trace
         &watch_prefixes,
     )?;
 
-    // Use a single userspace-authored root Exec op. This avoids the original
-    // spawn-to-map-registration race and prevents duplicate root Exec ops when
-    // BPF also observes sched_process_exec.
-    events.retain(|ev| !matches!(ev, TracedEvent::Exec { pid, .. } if *pid == child_pid));
+    // Use a single userspace-authored initial root Exec op. The first BPF root
+    // exec is consumed by EventCollectorState, while later exec replacements
+    // advance the epoch and remain visible.
     events.insert(
         0,
         TracedEvent::Exec {
-            pid: child_pid,
+            process: root_process,
             observation: root_observation,
         },
     );
@@ -283,7 +321,7 @@ pub fn trace_command(command: &[String], watch_dirs: &[PathBuf]) -> Result<Trace
     info!("Collected {} events", events.len());
     Ok(TraceResult {
         events,
-        root_pid: child_pid,
+        root_process,
         dropped_events,
     })
 }
@@ -370,13 +408,14 @@ fn process_event(
             let payload = unsafe { &event.payload.file_open };
             let external = event.source == 1;
             let process_id = payload.tgid;
+            let process = state.current_process(process_id);
             let path_len = (payload.path_len as usize).min(payload.path.len());
             let raw_path = std::str::from_utf8(&payload.path[..path_len])
                 .unwrap_or("<invalid utf8>")
                 .trim_end_matches('\0')
                 .to_string();
 
-            let raw_resolved = resolve_open_path(payload.tgid, payload.dfd, &raw_path);
+            let raw_resolved = state.resolve_path(process, payload.dfd, &raw_path);
             let proc_fd_path = format!("/proc/{}/fd/{}", payload.tgid, payload.fd);
             let proc_target = std::fs::read_link(&proc_fd_path)
                 .ok()
@@ -407,33 +446,41 @@ fn process_event(
                 &path
             };
             let handle = open_regular(handle_path).ok().flatten();
+            // O_TRUNC destroys the previous contents at open, so the pre-image
+            // is empty by definition. Observing the path instead would race
+            // with the process already writing through the new descriptor.
+            let truncated = payload.fd >= 0 && payload.flags & nix::libc::O_TRUNC as u32 != 0;
             let mut open_state = OpenFileState {
                 path,
                 handle,
                 flags: payload.flags,
-                open_observation: None,
+                open_observation: truncated
+                    .then(|| FileObservation::Content(EMPTY_CONTENT_HASH.to_string())),
             };
             let observation = open_state.open_observation();
             let event_path = open_state.path.clone();
 
             debug!(
-                "FileOpen pid={} tgid={} fd={} dfd={} path={} flags={} external={}",
+                "FileOpen pid={} tgid={} fd={} dfd={} path={} flags={:#x} external={} observation={}",
                 payload.pid,
                 process_id,
                 payload.fd,
                 payload.dfd,
                 open_state.path,
                 payload.flags,
-                external
+                external,
+                observation.identity()
             );
 
             // Track this fd for later close resolution.
             if payload.fd >= 0 {
-                state.fd_table.insert((process_id, payload.fd), open_state);
+                state
+                    .fd_table
+                    .insert((process.lifetime, payload.fd), open_state);
             }
 
             events.push(TracedEvent::FileOpen {
-                pid: process_id,
+                process,
                 path: event_path,
                 flags: payload.flags,
                 fd: payload.fd,
@@ -445,7 +492,8 @@ fn process_event(
             let payload = unsafe { &event.payload.file_close };
             let external = event.source == 1;
             let process_id = payload.tgid;
-            let mut open_state = state.fd_table.remove(&(process_id, payload.fd));
+            let process = state.current_process(process_id);
+            let mut open_state = state.fd_table.remove(&(process.lifetime, payload.fd));
             if external && open_state.is_none() {
                 return true;
             }
@@ -455,12 +503,17 @@ fn process_event(
             let path = open_state.map(|state| state.path);
 
             debug!(
-                "FileClose pid={} tgid={} fd={} path={:?} external={}",
-                payload.pid, process_id, payload.fd, path, external
+                "FileClose pid={} tgid={} fd={} path={:?} external={} observation={:?}",
+                payload.pid,
+                process_id,
+                payload.fd,
+                path,
+                external,
+                observation.as_ref().map(FileObservation::identity)
             );
 
             events.push(TracedEvent::FileClose {
-                pid: process_id,
+                process,
                 fd: payload.fd,
                 path,
                 external,
@@ -471,20 +524,29 @@ fn process_event(
             let payload = unsafe { &event.payload.file_mmap };
             let external = event.source == 1;
             let process_id = payload.tgid;
+            let process = state.current_process(process_id);
 
-            let (path, observation) = match state.fd_table.get_mut(&(process_id, payload.fd)) {
+            let (path, observation) = match state.fd_table.get_mut(&(process.lifetime, payload.fd))
+            {
                 Some(state) => (Some(state.path.clone()), Some(state.mmap_observation())),
                 None if external => return true,
                 None => (None, None),
             };
 
             debug!(
-                "FileMmap pid={} tgid={} fd={} prot={:#x} flags={:#x} path={:?} external={}",
-                payload.pid, process_id, payload.fd, payload.prot, payload.flags, path, external
+                "FileMmap pid={} tgid={} fd={} prot={:#x} flags={:#x} path={:?} external={} observation={:?}",
+                payload.pid,
+                process_id,
+                payload.fd,
+                payload.prot,
+                payload.flags,
+                path,
+                external,
+                observation.as_ref().map(FileObservation::identity)
             );
 
             events.push(TracedEvent::FileMmap {
-                pid: process_id,
+                process,
                 fd: payload.fd,
                 prot: payload.prot,
                 flags: payload.flags,
@@ -496,14 +558,15 @@ fn process_event(
         EventKind::FileRenameSource => {
             let payload = unsafe { &event.payload.file_path };
             let process_id = payload.tgid;
+            let process = state.current_process(process_id);
             let Some(raw_path) = decode_event_path(&payload.path, payload.path_len) else {
                 return false;
             };
-            let path = resolve_open_path(process_id, payload.dfd, &raw_path);
+            let path = state.resolve_path(process, payload.dfd, &raw_path);
             state.pending_renames.insert(
                 (payload.pid, payload.operation_id),
                 PendingRename {
-                    pid: process_id,
+                    process,
                     from_path: path,
                     flags: payload.flags,
                     external: event.source == 1,
@@ -526,7 +589,7 @@ fn process_event(
             let Some(raw_path) = decode_event_path(&payload.path, payload.path_len) else {
                 return false;
             };
-            let to_path = resolve_open_path(process_id, payload.dfd, &raw_path);
+            let to_path = state.resolve_path(pending.process, payload.dfd, &raw_path);
             let external = pending.external || event.source == 1;
             if external
                 && !watch_prefixes.iter().any(|prefix| {
@@ -550,7 +613,7 @@ fn process_event(
                 process_id, pending.from_path, to_path, pending.flags, external
             );
             events.push(TracedEvent::FileRename {
-                pid: pending.pid,
+                process: pending.process,
                 from_path: pending.from_path.clone(),
                 to_path: to_path.clone(),
                 flags: pending.flags,
@@ -559,7 +622,7 @@ fn process_event(
             });
             if let Some(observation) = reverse_observation {
                 events.push(TracedEvent::FileRename {
-                    pid: pending.pid,
+                    process: pending.process,
                     from_path: to_path,
                     to_path: pending.from_path,
                     flags: pending.flags,
@@ -571,10 +634,11 @@ fn process_event(
         EventKind::FileUnlink => {
             let payload = unsafe { &event.payload.file_path };
             let process_id = payload.tgid;
+            let process = state.current_process(process_id);
             let Some(raw_path) = decode_event_path(&payload.path, payload.path_len) else {
                 return false;
             };
-            let path = resolve_open_path(process_id, payload.dfd, &raw_path);
+            let path = state.resolve_path(process, payload.dfd, &raw_path);
             let external = event.source == 1;
             if external
                 && !watch_prefixes
@@ -594,7 +658,7 @@ fn process_event(
                 process_id, path, payload.flags, external
             );
             events.push(TracedEvent::FileUnlink {
-                pid: process_id,
+                process,
                 path,
                 flags: payload.flags,
                 external,
@@ -604,12 +668,15 @@ fn process_event(
         EventKind::ProcessExec => {
             let payload = unsafe { &event.payload.process_exec };
             let process_id = payload.tgid;
+            let Some(process) = state.exec_process(process_id) else {
+                return true;
+            };
             let name_len = (payload.filename_len as usize).min(payload.filename.len());
             let raw_filename = std::str::from_utf8(&payload.filename[..name_len])
                 .unwrap_or("<invalid utf8>")
                 .trim_end_matches('\0')
                 .to_string();
-            let raw_filename = resolve_exec_path(payload.tgid, &raw_filename);
+            let raw_filename = state.resolve_path(process, AT_FDCWD, &raw_filename);
             let proc_exe = format!("/proc/{}/exe", payload.tgid);
             let proc_target = std::fs::read_link(&proc_exe)
                 .ok()
@@ -639,20 +706,34 @@ fn process_event(
             );
 
             events.push(TracedEvent::Exec {
-                pid: process_id,
+                process,
                 observation,
             });
+        }
+        EventKind::ProcessFork => {
+            let payload = unsafe { &event.payload.process_fork };
+            let (parent, child) = state.fork_process(payload.parent_pid, payload.child_pid);
+            debug!(
+                "Fork parent={} generation={} epoch={} child={} generation={}",
+                parent.lifetime.pid,
+                parent.lifetime.generation,
+                parent.exec_epoch,
+                child.lifetime.pid,
+                child.lifetime.generation
+            );
+            events.push(TracedEvent::Fork { parent, child });
         }
         EventKind::ProcessExit => {
             let payload = unsafe { &event.payload.process_exit };
             let process_id = payload.tgid;
+            let process = state.exit_process(process_id);
             debug!(
                 "Exit pid={} tgid={} code={}",
                 payload.pid, process_id, payload.exit_code
             );
 
             events.push(TracedEvent::Exit {
-                pid: process_id,
+                process,
                 exit_code: payload.exit_code,
             });
         }
@@ -768,8 +849,11 @@ fn finish_child_exit(
     // which is authoritative.
     let mut found_exit = false;
     for ev in events.iter_mut().rev() {
-        if let TracedEvent::Exit { pid, exit_code, .. } = ev {
-            if *pid == child_pid {
+        if let TracedEvent::Exit {
+            process, exit_code, ..
+        } = ev
+        {
+            if process.lifetime.pid == child_pid {
                 *exit_code = real_exit_code;
                 found_exit = true;
                 break;
@@ -779,8 +863,9 @@ fn finish_child_exit(
 
     // If BPF missed the exit event, synthesize one.
     if !found_exit {
+        let process = state.exit_process(child_pid);
         events.push(TracedEvent::Exit {
-            pid: child_pid,
+            process,
             exit_code: real_exit_code,
         });
     }
@@ -813,17 +898,130 @@ fn wait_for_ring_event(ring_buf: &RingBuf<&mut aya::maps::MapData>, timeout_ms: 
 }
 
 struct PendingRename {
-    pid: u32,
+    process: ProcessInstance,
     from_path: String,
     flags: u32,
     external: bool,
 }
 
-#[derive(Default)]
 struct EventCollectorState {
-    fd_table: HashMap<(u32, i32), OpenFileState>,
+    root_process: ProcessInstance,
+    root_initial_exec_pending: bool,
+    current_processes: HashMap<u32, ProcessInstance>,
+    next_generations: HashMap<u32, u32>,
+    process_cwds: HashMap<ProcessLifetime, PathBuf>,
+    fd_table: HashMap<(ProcessLifetime, i32), OpenFileState>,
     pending_renames: HashMap<(u32, u64), PendingRename>,
     malformed_events: u64,
+}
+
+impl EventCollectorState {
+    fn new(root_pid: u32, root_cwd: PathBuf) -> Self {
+        let root_process = ProcessInstance {
+            lifetime: ProcessLifetime {
+                pid: root_pid,
+                generation: 0,
+            },
+            exec_epoch: 0,
+        };
+        Self {
+            root_process,
+            root_initial_exec_pending: true,
+            current_processes: HashMap::from([(root_pid, root_process)]),
+            next_generations: HashMap::from([(root_pid, 1)]),
+            process_cwds: HashMap::from([(root_process.lifetime, root_cwd)]),
+            fd_table: HashMap::new(),
+            pending_renames: HashMap::new(),
+            malformed_events: 0,
+        }
+    }
+
+    fn current_process(&mut self, pid: u32) -> ProcessInstance {
+        if let Some(process) = self.current_processes.get(&pid) {
+            return *process;
+        }
+        self.start_process(pid)
+    }
+
+    fn start_process(&mut self, pid: u32) -> ProcessInstance {
+        let generation = self.next_generations.entry(pid).or_insert(0);
+        let process = ProcessInstance {
+            lifetime: ProcessLifetime {
+                pid,
+                generation: *generation,
+            },
+            exec_epoch: 0,
+        };
+        *generation = generation.saturating_add(1);
+        self.current_processes.insert(pid, process);
+        process
+    }
+
+    fn fork_process(
+        &mut self,
+        parent_pid: u32,
+        child_pid: u32,
+    ) -> (ProcessInstance, ProcessInstance) {
+        let parent = self.current_process(parent_pid);
+        let child = self.start_process(child_pid);
+        if let Some(cwd) = self.process_cwds.get(&parent.lifetime).cloned() {
+            self.process_cwds.insert(child.lifetime, cwd);
+        }
+        let inherited_fds: Vec<(i32, OpenFileState)> = self
+            .fd_table
+            .iter()
+            .filter(|((lifetime, _), _)| *lifetime == parent.lifetime)
+            .map(|((_, fd), state)| (*fd, state.inherit()))
+            .collect();
+        for (fd, state) in inherited_fds {
+            self.fd_table.insert((child.lifetime, fd), state);
+        }
+        (parent, child)
+    }
+
+    fn exec_process(&mut self, pid: u32) -> Option<ProcessInstance> {
+        if pid == self.root_process.lifetime.pid && self.root_initial_exec_pending {
+            self.root_initial_exec_pending = false;
+            return None;
+        }
+
+        let mut process = self.current_process(pid);
+        process.exec_epoch = process.exec_epoch.saturating_add(1);
+        self.current_processes.insert(pid, process);
+        Some(process)
+    }
+
+    fn resolve_path(&mut self, process: ProcessInstance, dfd: i32, raw_path: &str) -> String {
+        if raw_path.starts_with('/') {
+            return raw_path.to_string();
+        }
+
+        let proc_path = if dfd == AT_FDCWD {
+            format!("/proc/{}/cwd", process.lifetime.pid)
+        } else {
+            format!("/proc/{}/fd/{dfd}", process.lifetime.pid)
+        };
+        if let Ok(base) = std::fs::read_link(proc_path) {
+            if dfd == AT_FDCWD {
+                self.process_cwds.insert(process.lifetime, base.clone());
+            }
+            return base.join(raw_path).to_string_lossy().into_owned();
+        }
+
+        if dfd == AT_FDCWD {
+            if let Some(base) = self.process_cwds.get(&process.lifetime) {
+                return base.join(raw_path).to_string_lossy().into_owned();
+            }
+        }
+
+        raw_path.to_string()
+    }
+
+    fn exit_process(&mut self, pid: u32) -> ProcessInstance {
+        let process = self.current_process(pid);
+        self.current_processes.remove(&pid);
+        process
+    }
 }
 
 struct OpenFileState {
@@ -834,6 +1032,15 @@ struct OpenFileState {
 }
 
 impl OpenFileState {
+    fn inherit(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            handle: self.handle.as_ref().and_then(|file| file.try_clone().ok()),
+            flags: self.flags,
+            open_observation: self.open_observation.clone(),
+        }
+    }
+
     fn observe_current(&mut self) -> FileObservation {
         self.handle
             .as_mut()
@@ -871,7 +1078,7 @@ fn decode_event_path(path: &[u8], path_len: u32) -> Option<String> {
 }
 
 fn rewrite_open_file_paths(
-    fd_table: &mut HashMap<(u32, i32), OpenFileState>,
+    fd_table: &mut HashMap<(ProcessLifetime, i32), OpenFileState>,
     from_path: &str,
     to_path: &str,
     flags: u32,
@@ -901,28 +1108,6 @@ fn rewrite_path_prefix(path: &str, from_path: &str, to_path: &str) -> Option<Str
         return None;
     }
     Some(format!("{to_path}{suffix}"))
-}
-
-fn resolve_open_path(tgid: u32, dfd: i32, raw_path: &str) -> String {
-    if raw_path.starts_with('/') {
-        return raw_path.to_string();
-    }
-
-    let base = if dfd == AT_FDCWD {
-        std::fs::read_link(format!("/proc/{tgid}/cwd"))
-    } else {
-        std::fs::read_link(format!("/proc/{tgid}/fd/{dfd}"))
-    };
-    base.map(|base| base.join(raw_path).to_string_lossy().into_owned())
-        .unwrap_or_else(|_| raw_path.to_string())
-}
-
-fn resolve_exec_path(tgid: u32, raw_path: &str) -> String {
-    if raw_path.starts_with('/') {
-        raw_path.to_string()
-    } else {
-        resolve_open_path(tgid, AT_FDCWD, raw_path)
-    }
 }
 
 fn paths_agree(raw_path: &str, proc_target: &str) -> bool {
@@ -1000,6 +1185,15 @@ fn load_ebpf() -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    const TEST_LIFETIME: ProcessLifetime = ProcessLifetime {
+        pid: 1,
+        generation: 0,
+    };
+
+    fn test_state(root_pid: u32) -> EventCollectorState {
+        EventCollectorState::new(root_pid, PathBuf::from("/workspace"))
+    }
+
     #[test]
     fn proc_target_must_match_more_than_an_absolute_basename() {
         assert!(!paths_agree("/tmp/first/output.o", "/tmp/second/output.o"));
@@ -1013,7 +1207,7 @@ mod tests {
     fn rename_rewrites_open_file_paths_at_directory_boundaries() {
         let mut fd_table = HashMap::new();
         fd_table.insert(
-            (1, 3),
+            (TEST_LIFETIME, 3),
             OpenFileState {
                 path: "/tmp/old/artifact".to_string(),
                 handle: None,
@@ -1022,7 +1216,7 @@ mod tests {
             },
         );
         fd_table.insert(
-            (1, 4),
+            (TEST_LIFETIME, 4),
             OpenFileState {
                 path: "/tmp/older/unrelated".to_string(),
                 handle: None,
@@ -1033,8 +1227,8 @@ mod tests {
 
         rewrite_open_file_paths(&mut fd_table, "/tmp/old", "/tmp/new", 0);
 
-        assert_eq!(fd_table[&(1, 3)].path, "/tmp/new/artifact");
-        assert_eq!(fd_table[&(1, 4)].path, "/tmp/older/unrelated");
+        assert_eq!(fd_table[&(TEST_LIFETIME, 3)].path, "/tmp/new/artifact");
+        assert_eq!(fd_table[&(TEST_LIFETIME, 4)].path, "/tmp/older/unrelated");
     }
 
     #[test]
@@ -1042,7 +1236,7 @@ mod tests {
         let mut fd_table = HashMap::new();
         for (fd, path) in [(3, "/tmp/left"), (4, "/tmp/right")] {
             fd_table.insert(
-                (1, fd),
+                (TEST_LIFETIME, fd),
                 OpenFileState {
                     path: path.to_string(),
                     handle: None,
@@ -1054,7 +1248,86 @@ mod tests {
 
         rewrite_open_file_paths(&mut fd_table, "/tmp/left", "/tmp/right", RENAME_EXCHANGE);
 
-        assert_eq!(fd_table[&(1, 3)].path, "/tmp/right");
-        assert_eq!(fd_table[&(1, 4)].path, "/tmp/left");
+        assert_eq!(fd_table[&(TEST_LIFETIME, 3)].path, "/tmp/right");
+        assert_eq!(fd_table[&(TEST_LIFETIME, 4)].path, "/tmp/left");
+    }
+
+    #[test]
+    fn root_exec_epochs_advance_after_the_synthetic_initial_exec() {
+        let mut state = test_state(42);
+
+        assert_eq!(state.exec_process(42), None);
+        assert_eq!(
+            state.exec_process(42),
+            Some(ProcessInstance::test_epoch(42, 1))
+        );
+        assert_eq!(
+            state.exec_process(42),
+            Some(ProcessInstance::test_epoch(42, 2))
+        );
+    }
+
+    #[test]
+    fn forked_processes_get_new_lifetimes_when_pids_are_reused() {
+        let mut state = test_state(1);
+
+        let (parent, child) = state.fork_process(1, 2);
+        assert_eq!(parent, ProcessInstance::test(1));
+        assert_eq!(child, ProcessInstance::test(2));
+        assert_eq!(
+            state.exec_process(2),
+            Some(ProcessInstance::test_epoch(2, 1))
+        );
+        assert_eq!(state.exit_process(2), ProcessInstance::test_epoch(2, 1));
+
+        let (_, reused) = state.fork_process(1, 2);
+        assert_eq!(reused.lifetime.pid, 2);
+        assert_eq!(reused.lifetime.generation, 1);
+        assert_eq!(reused.exec_epoch, 0);
+    }
+
+    #[test]
+    fn forked_processes_inherit_open_descriptor_state() {
+        let mut state = test_state(1);
+        state.fd_table.insert(
+            (state.root_process.lifetime, 3),
+            OpenFileState {
+                path: "/tmp/inherited".to_string(),
+                handle: None,
+                flags: 1,
+                open_observation: Some(FileObservation::Content("sha256:input".to_string())),
+            },
+        );
+
+        let (_, child) = state.fork_process(1, 2);
+        let inherited = &state.fd_table[&(child.lifetime, 3)];
+        assert_eq!(inherited.path, "/tmp/inherited");
+        assert_eq!(inherited.flags, 1);
+        assert!(matches!(
+            inherited.open_observation,
+            Some(FileObservation::Content(ref hash)) if hash == "sha256:input"
+        ));
+    }
+
+    #[test]
+    fn cached_working_directory_resolves_paths_after_proc_disappears() {
+        let mut state = test_state(u32::MAX);
+        let process = state.root_process;
+
+        assert_eq!(
+            state.resolve_path(process, AT_FDCWD, "dist/hello"),
+            "/workspace/dist/hello"
+        );
+    }
+
+    #[test]
+    fn forked_processes_inherit_cached_working_directories() {
+        let mut state = test_state(u32::MAX - 1);
+        let (_, child) = state.fork_process(u32::MAX - 1, u32::MAX);
+
+        assert_eq!(
+            state.resolve_path(child, AT_FDCWD, "dist/hello"),
+            "/workspace/dist/hello"
+        );
     }
 }

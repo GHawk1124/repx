@@ -879,14 +879,30 @@ pub fn repx_fork(ctx: TracePointContext) -> u32 {
 fn try_fork(ctx: &TracePointContext) -> Result<u32, i64> {
     // sched_process_fork layout:
     //   offset  8: parent_comm[16] (char[16])
-    //   offset 24: parent_pid      (pid_t, 4 bytes)
     //   offset 28: child_comm[16]  (char[16])
     //   offset 44: child_pid       (pid_t, 4 bytes)
-    let parent_pid: u32 = unsafe { ctx.read_at(24)? };
+    // Use the current thread-group ID for the parent so forks issued by a
+    // non-leader thread still attach to the correct process lifetime.
+    let parent_pid = (bpf_get_current_pid_tgid() >> 32) as u32;
     let child_pid: u32 = unsafe { ctx.read_at(44)? };
 
     if !is_tracked(parent_pid) {
         return Ok(0);
+    }
+
+    if let Some(mut entry) = EVENTS.reserve::<Event>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = EventKind::ProcessFork as u32;
+        event.source = 0;
+        event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
+
+        let payload = unsafe { &mut event.payload.process_fork };
+        payload.parent_pid = parent_pid;
+        payload.child_pid = child_pid;
+
+        entry.submit(0);
+    } else {
+        record_drop();
     }
 
     track_pid(child_pid);
@@ -915,6 +931,12 @@ fn try_exit(_ctx: &TracePointContext) -> Result<u32, i64> {
         return Ok(0);
     }
 
+    // sched_process_exit fires for every thread. Process lifetimes end only
+    // when the thread-group leader exits.
+    if pid != tgid {
+        return Ok(0);
+    }
+
     if let Some(mut entry) = EVENTS.reserve::<Event>(0) {
         let event = unsafe { &mut *entry.as_mut_ptr() };
         event.kind = EventKind::ProcessExit as u32;
@@ -931,9 +953,7 @@ fn try_exit(_ctx: &TracePointContext) -> Result<u32, i64> {
         record_drop();
     }
 
-    if pid == tgid {
-        untrack_pid(tgid);
-    }
+    untrack_pid(tgid);
 
     Ok(0)
 }

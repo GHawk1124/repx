@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 use crate::file_identity::{is_path_within, is_system_state, SYSTEM_STATE_SENTINEL};
-use crate::tracer::TracedEvent;
+use crate::tracer::{ProcessInstance, ProcessLifetime, TracedEvent};
 
 /// A canonicalized build operation, independent of any specific system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,51 +127,53 @@ fn is_watched_path(path: &str, watch_prefixes: &[String]) -> bool {
 
 /// Canonicalize raw traced events into system-independent operations.
 ///
-/// `root_pid` is the PID of the root traced process (from the tracer).
+/// `root_process` is the initial exec instance of the root traced process.
 /// This is used to determine which process gets its exit code included
 /// in the canonical hash (only the root, since BPF can't capture exit
 /// codes for child processes).
 pub fn canonicalize_events(
     events: Vec<TracedEvent>,
-    root_pid: u32,
+    root_process: ProcessInstance,
     watch_prefixes: &[String],
 ) -> Result<Vec<CanonicalOp>> {
     let mut ops = Vec::new();
 
     // Map real PIDs to logical process indices.
     // The root process is always assigned index 0 explicitly.
-    let mut pid_to_index: HashMap<u32, u32> = HashMap::new();
-    pid_to_index.insert(root_pid, 0);
+    let mut process_to_index: HashMap<ProcessInstance, u32> = HashMap::new();
+    process_to_index.insert(root_process, 0);
     let mut next_index: u32 = 1;
 
-    // Track pending write ops by (pid, fd) -> index into ops vec.
+    // Track pending write ops by (process lifetime, fd) -> index into ops vec.
     // When a file is closed, we look up the matching write op by fd
     // instead of scanning backwards for "most recent write by process".
-    let mut pending_writes: HashMap<(u32, i32), usize> = HashMap::new();
+    let mut pending_writes: HashMap<(ProcessLifetime, i32), usize> = HashMap::new();
 
     // External events (from watched paths, non-fork-tree processes).
     // Collected separately and sorted by hash for deterministic ordering,
     // since external event arrival order is non-deterministic.
     let mut external_ops: Vec<CanonicalOp> = Vec::new();
-    let mut external_pending_writes: HashMap<(u32, i32), usize> = HashMap::new();
-    let mut fallback_external_pids: HashSet<u32> = HashSet::new();
+    let mut external_pending_writes: HashMap<(ProcessLifetime, i32), usize> = HashMap::new();
+    let mut fallback_external_processes: HashSet<ProcessLifetime> = HashSet::new();
 
-    let mut pid_to_tool_hash: HashMap<u32, String> = HashMap::new();
+    let mut process_to_tool_hash: HashMap<ProcessInstance, String> = HashMap::new();
 
     for event in &events {
         match event {
             TracedEvent::Exec {
-                pid, observation, ..
+                process,
+                observation,
+                ..
             } => {
                 // Assign logical index if new.
-                if !pid_to_index.contains_key(pid) {
-                    pid_to_index.insert(*pid, next_index);
+                if !process_to_index.contains_key(process) {
+                    process_to_index.insert(*process, next_index);
                     next_index += 1;
                 }
-                let proc_idx = pid_to_index[pid];
+                let proc_idx = process_to_index[process];
 
                 let tool_hash = observation.identity();
-                pid_to_tool_hash.insert(*pid, tool_hash.clone());
+                process_to_tool_hash.insert(*process, tool_hash.clone());
 
                 // Argv is intentionally empty: BPF kernel-stack captures are
                 // racy (the same exec yields different argv across runs) and
@@ -188,8 +190,23 @@ pub fn canonicalize_events(
                 });
             }
 
+            TracedEvent::Fork { parent, child } => {
+                if let Some(tool_hash) = process_to_tool_hash.get(parent).cloned() {
+                    process_to_tool_hash.insert(*child, tool_hash);
+                }
+                let inherited_writes: Vec<(i32, usize)> = pending_writes
+                    .iter()
+                    .filter_map(|((lifetime, fd), op_idx)| {
+                        (*lifetime == parent.lifetime).then_some((*fd, *op_idx))
+                    })
+                    .collect();
+                for (fd, op_idx) in inherited_writes {
+                    pending_writes.insert((child.lifetime, fd), op_idx);
+                }
+            }
+
             TracedEvent::FileOpen {
-                pid,
+                process,
                 path,
                 flags,
                 fd,
@@ -207,13 +224,13 @@ pub fn canonicalize_events(
                 let can_write = access_mode != 0;
 
                 let fallback_external = !*external
-                    && *pid != root_pid
+                    && process.lifetime != root_process.lifetime
                     && is_watched_path(path, watch_prefixes)
-                    && (fallback_external_pids.contains(pid)
-                        || !pid_to_tool_hash.contains_key(pid));
+                    && (fallback_external_processes.contains(&process.lifetime)
+                        || !process_to_tool_hash.contains_key(process));
 
                 if *external || fallback_external {
-                    fallback_external_pids.insert(*pid);
+                    fallback_external_processes.insert(process.lifetime);
                     // External process touching a watched path.
                     if can_read {
                         external_ops.push(CanonicalOp {
@@ -235,22 +252,22 @@ pub fn canonicalize_events(
                             input_hashes: vec![],
                             output_hashes: vec![],
                         });
-                        external_pending_writes.insert((*pid, *fd), op_idx);
+                        external_pending_writes.insert((process.lifetime, *fd), op_idx);
                     }
                     continue;
                 }
 
-                if !pid_to_index.contains_key(pid) {
-                    pid_to_index.insert(*pid, next_index);
+                if !process_to_index.contains_key(process) {
+                    process_to_index.insert(*process, next_index);
                     next_index += 1;
                 }
-                let proc_idx = pid_to_index[pid];
+                let proc_idx = process_to_index[process];
 
                 if is_system_state(path) {
                     ops.push(CanonicalOp {
                         op_type: OpType::SystemStateRead,
                         process_index: proc_idx,
-                        tool_hash: pid_to_tool_hash.get(pid).cloned(),
+                        tool_hash: process_to_tool_hash.get(process).cloned(),
                         args: vec![],
                         input_hashes: vec![SYSTEM_STATE_SENTINEL.to_string()],
                         output_hashes: vec![],
@@ -260,7 +277,7 @@ pub fn canonicalize_events(
                         ops.push(CanonicalOp {
                             op_type: OpType::FileRead,
                             process_index: proc_idx,
-                            tool_hash: pid_to_tool_hash.get(pid).cloned(),
+                            tool_hash: process_to_tool_hash.get(process).cloned(),
                             args: vec![],
                             input_hashes: vec![observation.identity()],
                             output_hashes: vec![],
@@ -273,18 +290,18 @@ pub fn canonicalize_events(
                         ops.push(CanonicalOp {
                             op_type: OpType::FileWrite,
                             process_index: proc_idx,
-                            tool_hash: pid_to_tool_hash.get(pid).cloned(),
+                            tool_hash: process_to_tool_hash.get(process).cloned(),
                             args: vec![],
                             input_hashes: vec![],
                             output_hashes: vec![], // filled when we see the close
                         });
-                        pending_writes.insert((*pid, *fd), op_idx);
+                        pending_writes.insert((process.lifetime, *fd), op_idx);
                     }
                 }
             }
 
             TracedEvent::FileMmap {
-                pid,
+                process,
                 fd,
                 prot,
                 flags,
@@ -308,13 +325,13 @@ pub fn canonicalize_events(
                     let is_write = (prot & 0x2) != 0 && (flags & 0x1) != 0;
 
                     let fallback_external = !*external
-                        && (*pid != root_pid)
+                        && process.lifetime != root_process.lifetime
                         && is_watched_path(path, watch_prefixes)
-                        && (fallback_external_pids.contains(pid)
-                            || !pid_to_tool_hash.contains_key(pid));
+                        && (fallback_external_processes.contains(&process.lifetime)
+                            || !process_to_tool_hash.contains_key(process));
 
                     if *external || fallback_external {
-                        fallback_external_pids.insert(*pid);
+                        fallback_external_processes.insert(process.lifetime);
                         external_ops.push(CanonicalOp {
                             op_type: OpType::ExternalFileRead,
                             process_index: u32::MAX,
@@ -325,7 +342,7 @@ pub fn canonicalize_events(
                         });
                         if is_write {
                             external_pending_writes
-                                .entry((*pid, *fd))
+                                .entry((process.lifetime, *fd))
                                 .or_insert_with(|| {
                                     let op_idx = external_ops.len();
                                     external_ops.push(CanonicalOp {
@@ -342,17 +359,17 @@ pub fn canonicalize_events(
                         continue;
                     }
 
-                    if !pid_to_index.contains_key(pid) {
-                        pid_to_index.insert(*pid, next_index);
+                    if !process_to_index.contains_key(process) {
+                        process_to_index.insert(*process, next_index);
                         next_index += 1;
                     }
-                    let proc_idx = pid_to_index[pid];
+                    let proc_idx = process_to_index[process];
 
                     if is_system_state(path) {
                         ops.push(CanonicalOp {
                             op_type: OpType::SystemStateRead,
                             process_index: proc_idx,
-                            tool_hash: pid_to_tool_hash.get(pid).cloned(),
+                            tool_hash: process_to_tool_hash.get(process).cloned(),
                             args: vec![],
                             input_hashes: vec![SYSTEM_STATE_SENTINEL.to_string()],
                             output_hashes: vec![],
@@ -361,32 +378,34 @@ pub fn canonicalize_events(
                         ops.push(CanonicalOp {
                             op_type: OpType::FileRead,
                             process_index: proc_idx,
-                            tool_hash: pid_to_tool_hash.get(pid).cloned(),
+                            tool_hash: process_to_tool_hash.get(process).cloned(),
                             args: vec!["mmap".to_string()],
                             input_hashes: vec![observation.identity()],
                             output_hashes: vec![],
                         });
 
                         if is_write {
-                            pending_writes.entry((*pid, *fd)).or_insert_with(|| {
-                                let op_idx = ops.len();
-                                ops.push(CanonicalOp {
-                                    op_type: OpType::FileWrite,
-                                    process_index: proc_idx,
-                                    tool_hash: pid_to_tool_hash.get(pid).cloned(),
-                                    args: vec![],
-                                    input_hashes: vec![],
-                                    output_hashes: vec![],
+                            pending_writes
+                                .entry((process.lifetime, *fd))
+                                .or_insert_with(|| {
+                                    let op_idx = ops.len();
+                                    ops.push(CanonicalOp {
+                                        op_type: OpType::FileWrite,
+                                        process_index: proc_idx,
+                                        tool_hash: process_to_tool_hash.get(process).cloned(),
+                                        args: vec![],
+                                        input_hashes: vec![],
+                                        output_hashes: vec![],
+                                    });
+                                    op_idx
                                 });
-                                op_idx
-                            });
                         }
                     }
                 }
             }
 
             TracedEvent::FileClose {
-                pid,
+                process,
                 fd,
                 path,
                 external,
@@ -395,30 +414,32 @@ pub fn canonicalize_events(
             } => {
                 if let Some(path) = path {
                     let fallback_external = !*external
-                        && (*pid != root_pid)
-                        && fallback_external_pids.contains(pid)
+                        && process.lifetime != root_process.lifetime
+                        && fallback_external_processes.contains(&process.lifetime)
                         && is_watched_path(path, watch_prefixes);
 
                     if *external || fallback_external {
                         // Resolve pending external write if any.
-                        if let Some(op_idx) = external_pending_writes.remove(&(*pid, *fd)) {
+                        if let Some(op_idx) =
+                            external_pending_writes.remove(&(process.lifetime, *fd))
+                        {
                             if let (Some(op), Some(observation)) =
                                 (external_ops.get_mut(op_idx), observation)
                             {
-                                op.output_hashes.push(observation.identity());
+                                op.output_hashes = vec![observation.identity()];
                             }
                         }
-                    } else if let Some(op_idx) = pending_writes.remove(&(*pid, *fd)) {
+                    } else if let Some(op_idx) = pending_writes.remove(&(process.lifetime, *fd)) {
                         // Fork-tree pending write.
                         if let (Some(op), Some(observation)) = (ops.get_mut(op_idx), observation) {
-                            op.output_hashes.push(observation.identity());
+                            op.output_hashes = vec![observation.identity()];
                         }
                     }
                 }
             }
 
             TracedEvent::FileRename {
-                pid,
+                process,
                 from_path,
                 to_path,
                 flags,
@@ -426,16 +447,16 @@ pub fn canonicalize_events(
                 observation,
             } => {
                 let fallback_external = !*external
-                    && *pid != root_pid
+                    && process.lifetime != root_process.lifetime
                     && (is_watched_path(from_path, watch_prefixes)
                         || is_watched_path(to_path, watch_prefixes))
-                    && (fallback_external_pids.contains(pid)
-                        || !pid_to_tool_hash.contains_key(pid));
+                    && (fallback_external_processes.contains(&process.lifetime)
+                        || !process_to_tool_hash.contains_key(process));
                 let identity = observation.identity();
                 let args = vec![format!("flags:{flags:#x}")];
 
                 if *external || fallback_external {
-                    fallback_external_pids.insert(*pid);
+                    fallback_external_processes.insert(process.lifetime);
                     external_ops.push(CanonicalOp {
                         op_type: OpType::ExternalFileRename,
                         process_index: u32::MAX,
@@ -445,14 +466,14 @@ pub fn canonicalize_events(
                         output_hashes: vec![identity],
                     });
                 } else {
-                    if !pid_to_index.contains_key(pid) {
-                        pid_to_index.insert(*pid, next_index);
+                    if !process_to_index.contains_key(process) {
+                        process_to_index.insert(*process, next_index);
                         next_index += 1;
                     }
                     ops.push(CanonicalOp {
                         op_type: OpType::FileRename,
-                        process_index: pid_to_index[pid],
-                        tool_hash: pid_to_tool_hash.get(pid).cloned(),
+                        process_index: process_to_index[process],
+                        tool_hash: process_to_tool_hash.get(process).cloned(),
                         args,
                         input_hashes: vec![identity.clone()],
                         output_hashes: vec![identity],
@@ -461,21 +482,21 @@ pub fn canonicalize_events(
             }
 
             TracedEvent::FileUnlink {
-                pid,
+                process,
                 path,
                 flags,
                 external,
                 observation,
             } => {
                 let fallback_external = !*external
-                    && *pid != root_pid
+                    && process.lifetime != root_process.lifetime
                     && is_watched_path(path, watch_prefixes)
-                    && (fallback_external_pids.contains(pid)
-                        || !pid_to_tool_hash.contains_key(pid));
+                    && (fallback_external_processes.contains(&process.lifetime)
+                        || !process_to_tool_hash.contains_key(process));
                 let args = vec![format!("flags:{flags:#x}")];
 
                 if *external || fallback_external {
-                    fallback_external_pids.insert(*pid);
+                    fallback_external_processes.insert(process.lifetime);
                     external_ops.push(CanonicalOp {
                         op_type: OpType::ExternalFileDelete,
                         process_index: u32::MAX,
@@ -485,14 +506,14 @@ pub fn canonicalize_events(
                         output_hashes: vec![],
                     });
                 } else {
-                    if !pid_to_index.contains_key(pid) {
-                        pid_to_index.insert(*pid, next_index);
+                    if !process_to_index.contains_key(process) {
+                        process_to_index.insert(*process, next_index);
                         next_index += 1;
                     }
                     ops.push(CanonicalOp {
                         op_type: OpType::FileDelete,
-                        process_index: pid_to_index[pid],
-                        tool_hash: pid_to_tool_hash.get(pid).cloned(),
+                        process_index: process_to_index[process],
+                        tool_hash: process_to_tool_hash.get(process).cloned(),
                         args,
                         input_hashes: vec![observation.identity()],
                         output_hashes: vec![],
@@ -500,13 +521,15 @@ pub fn canonicalize_events(
                 }
             }
 
-            TracedEvent::Exit { pid, exit_code, .. } => {
-                if let Some(&proc_idx) = pid_to_index.get(pid) {
+            TracedEvent::Exit {
+                process, exit_code, ..
+            } => {
+                if let Some(&proc_idx) = process_to_index.get(process) {
                     // Only include exit code for the root process, which
                     // gets the real exit code from waitpid(). Child processes
                     // always report 0 from BPF (task_struct is opaque), so
                     // we exclude their exit code to avoid false confidence.
-                    let args = if *pid == root_pid {
+                    let args = if process.lifetime == root_process.lifetime {
                         vec![format!("exit:{}", exit_code)]
                     } else {
                         vec![]
@@ -514,7 +537,7 @@ pub fn canonicalize_events(
                     ops.push(CanonicalOp {
                         op_type: OpType::Exit,
                         process_index: proc_idx,
-                        tool_hash: pid_to_tool_hash.get(pid).cloned(),
+                        tool_hash: process_to_tool_hash.get(process).cloned(),
                         args,
                         input_hashes: vec![],
                         output_hashes: vec![],
@@ -532,7 +555,7 @@ pub fn canonicalize_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_identity::observe_path;
+    use crate::file_identity::{observe_path, FileObservation};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_test_dir(name: &str) -> std::path::PathBuf {
@@ -550,14 +573,14 @@ mod tests {
     fn drops_external_opens_outside_watched_prefixes() {
         let ops = canonicalize_events(
             vec![TracedEvent::FileOpen {
-                pid: 2,
+                process: ProcessInstance::test(2),
                 path: "/tmp/not-watched".to_string(),
                 flags: 1,
                 fd: 3,
                 external: true,
                 observation: observe_path("/tmp/not-watched"),
             }],
-            1,
+            ProcessInstance::test(1),
             &["/watched".to_string()],
         )
         .unwrap();
@@ -569,7 +592,7 @@ mod tests {
     fn drops_external_mmaps_outside_watched_prefixes() {
         let ops = canonicalize_events(
             vec![TracedEvent::FileMmap {
-                pid: 2,
+                process: ProcessInstance::test(2),
                 fd: 3,
                 prot: 0,
                 flags: 0x2,
@@ -577,7 +600,7 @@ mod tests {
                 external: true,
                 observation: Some(observe_path("/tmp/not-watched")),
             }],
-            1,
+            ProcessInstance::test(1),
             &["/watched".to_string()],
         )
         .unwrap();
@@ -598,7 +621,7 @@ mod tests {
         let ops = canonicalize_events(
             vec![
                 TracedEvent::FileOpen {
-                    pid: 2,
+                    process: ProcessInstance::test(2),
                     path: write_path.to_string_lossy().to_string(),
                     flags: 1,
                     fd: 3,
@@ -606,11 +629,11 @@ mod tests {
                     observation: observe_path(&write_path.to_string_lossy()),
                 },
                 TracedEvent::Exec {
-                    pid: 2,
+                    process: ProcessInstance::test(2),
                     observation: observe_path("/bin/true"),
                 },
                 TracedEvent::FileMmap {
-                    pid: 2,
+                    process: ProcessInstance::test(2),
                     fd: 4,
                     prot: 0,
                     flags: 0x2,
@@ -619,14 +642,14 @@ mod tests {
                     observation: Some(observe_path(&mmap_path.to_string_lossy())),
                 },
                 TracedEvent::FileClose {
-                    pid: 2,
+                    process: ProcessInstance::test(2),
                     fd: 3,
                     path: Some(write_path.to_string_lossy().to_string()),
                     external: false,
                     observation: Some(observe_path(&write_path.to_string_lossy())),
                 },
             ],
-            1,
+            ProcessInstance::test(1),
             &[dir.to_string_lossy().to_string()],
         )
         .unwrap();
@@ -664,7 +687,7 @@ mod tests {
         let ops = canonicalize_events(
             vec![
                 TracedEvent::FileOpen {
-                    pid: 1,
+                    process: ProcessInstance::test(1),
                     path: path.to_string_lossy().into_owned(),
                     flags: 2,
                     fd: 3,
@@ -672,14 +695,14 @@ mod tests {
                     observation: observation.clone(),
                 },
                 TracedEvent::FileClose {
-                    pid: 1,
+                    process: ProcessInstance::test(1),
                     fd: 3,
                     path: Some(path.to_string_lossy().into_owned()),
                     external: false,
                     observation: Some(observation),
                 },
             ],
-            1,
+            ProcessInstance::test(1),
             &[],
         )
         .unwrap();
@@ -698,7 +721,7 @@ mod tests {
 
         let ops = canonicalize_events(
             vec![TracedEvent::FileMmap {
-                pid: 1,
+                process: ProcessInstance::test(1),
                 fd: 3,
                 prot: 0x3,
                 flags: 0x2,
@@ -706,7 +729,7 @@ mod tests {
                 external: false,
                 observation: Some(observe_path(&path.to_string_lossy())),
             }],
-            1,
+            ProcessInstance::test(1),
             &[],
         )
         .unwrap();
@@ -728,7 +751,7 @@ mod tests {
         let ops = canonicalize_events(
             vec![
                 TracedEvent::FileRename {
-                    pid: 1,
+                    process: ProcessInstance::test(1),
                     from_path: from.to_string_lossy().into_owned(),
                     to_path: to.to_string_lossy().into_owned(),
                     flags: 0,
@@ -736,14 +759,14 @@ mod tests {
                     observation: observation.clone(),
                 },
                 TracedEvent::FileUnlink {
-                    pid: 1,
+                    process: ProcessInstance::test(1),
                     path: to.to_string_lossy().into_owned(),
                     flags: 0,
                     external: false,
                     observation,
                 },
             ],
-            1,
+            ProcessInstance::test(1),
             &[],
         )
         .unwrap();
@@ -751,5 +774,149 @@ mod tests {
         assert!(ops.iter().any(|op| op.op_type == OpType::FileRename));
         assert!(ops.iter().any(|op| op.op_type == OpType::FileDelete));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reexec_attributes_operations_to_the_active_executable() {
+        let initial = ProcessInstance::test(1);
+        let reexec = ProcessInstance::test_epoch(1, 1);
+        let initial_tool = "sha256:initial-tool".to_string();
+        let reexec_tool = "sha256:reexec-tool".to_string();
+
+        let ops = canonicalize_events(
+            vec![
+                TracedEvent::Exec {
+                    process: initial,
+                    observation: FileObservation::Content(initial_tool.clone()),
+                },
+                TracedEvent::FileOpen {
+                    process: initial,
+                    path: "/workspace/initial-input".to_string(),
+                    flags: 0,
+                    fd: 3,
+                    external: false,
+                    observation: FileObservation::Content("sha256:initial-input".to_string()),
+                },
+                TracedEvent::Exec {
+                    process: reexec,
+                    observation: FileObservation::Content(reexec_tool.clone()),
+                },
+                TracedEvent::FileOpen {
+                    process: reexec,
+                    path: "/workspace/reexec-input".to_string(),
+                    flags: 0,
+                    fd: 4,
+                    external: false,
+                    observation: FileObservation::Content("sha256:reexec-input".to_string()),
+                },
+            ],
+            initial,
+            &[],
+        )
+        .unwrap();
+
+        assert!(ops.iter().any(|op| {
+            op.op_type == OpType::FileRead
+                && op.tool_hash.as_ref() == Some(&initial_tool)
+                && op.input_hashes == ["sha256:initial-input"]
+        }));
+        assert!(ops.iter().any(|op| {
+            op.op_type == OpType::FileRead
+                && op.tool_hash.as_ref() == Some(&reexec_tool)
+                && op.input_hashes == ["sha256:reexec-input"]
+        }));
+    }
+
+    #[test]
+    fn forked_process_inherits_the_parent_executable() {
+        let parent = ProcessInstance::test(1);
+        let child = ProcessInstance::test(2);
+        let tool_hash = "sha256:parent-tool".to_string();
+
+        let ops = canonicalize_events(
+            vec![
+                TracedEvent::Exec {
+                    process: parent,
+                    observation: FileObservation::Content(tool_hash.clone()),
+                },
+                TracedEvent::Fork { parent, child },
+                TracedEvent::FileOpen {
+                    process: child,
+                    path: "/workspace/child-input".to_string(),
+                    flags: 0,
+                    fd: 3,
+                    external: false,
+                    observation: FileObservation::Content("sha256:child-input".to_string()),
+                },
+            ],
+            parent,
+            &[],
+        )
+        .unwrap();
+
+        assert!(ops.iter().any(|op| {
+            op.op_type == OpType::FileRead
+                && op.tool_hash.as_ref() == Some(&tool_hash)
+                && op.input_hashes == ["sha256:child-input"]
+        }));
+    }
+
+    #[test]
+    fn inherited_writable_fd_closes_against_the_opening_instance() {
+        let parent = ProcessInstance::test(1);
+        let child = ProcessInstance::test(2);
+        let child_exec = ProcessInstance::test_epoch(2, 1);
+        let parent_tool = "sha256:parent-tool".to_string();
+        let child_tool = "sha256:child-tool".to_string();
+
+        let ops = canonicalize_events(
+            vec![
+                TracedEvent::Exec {
+                    process: parent,
+                    observation: FileObservation::Content(parent_tool.clone()),
+                },
+                TracedEvent::FileOpen {
+                    process: parent,
+                    path: "/workspace/output".to_string(),
+                    flags: 1,
+                    fd: 3,
+                    external: false,
+                    observation: FileObservation::Content("sha256:old-output".to_string()),
+                },
+                TracedEvent::Fork { parent, child },
+                TracedEvent::FileClose {
+                    process: parent,
+                    fd: 3,
+                    path: Some("/workspace/output".to_string()),
+                    external: false,
+                    observation: Some(FileObservation::Content(
+                        "sha256:intermediate-output".to_string(),
+                    )),
+                },
+                TracedEvent::Exec {
+                    process: child_exec,
+                    observation: FileObservation::Content(child_tool.clone()),
+                },
+                TracedEvent::FileClose {
+                    process: child_exec,
+                    fd: 3,
+                    path: Some("/workspace/output".to_string()),
+                    external: false,
+                    observation: Some(FileObservation::Content("sha256:output".to_string())),
+                },
+            ],
+            parent,
+            &[],
+        )
+        .unwrap();
+
+        assert!(ops.iter().any(|op| {
+            op.op_type == OpType::FileWrite
+                && op.tool_hash.as_ref() == Some(&parent_tool)
+                && op.output_hashes == ["sha256:output"]
+        }));
+        assert!(!ops.iter().any(|op| {
+            op.op_type == OpType::FileWrite && op.tool_hash.as_ref() == Some(&child_tool)
+        }));
     }
 }
