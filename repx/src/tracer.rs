@@ -726,7 +726,15 @@ fn process_event(
         EventKind::ProcessExit => {
             let payload = unsafe { &event.payload.process_exit };
             let process_id = payload.tgid;
-            let process = state.exit_process(process_id);
+            // Don't remove from current_processes during event processing.
+            // With deferred (timestamp-sorted) processing, FileClose events
+            // for short-lived processes like dd can sort after ProcessExit.
+            // Removing the process would cause current_process() to create
+            // a new ProcessInstance with a different generation, breaking
+            // the fd_table lookup and losing write attribution.
+            // PID reuse is still handled correctly: fork_process calls
+            // start_process which overwrites current_processes entries.
+            let process = state.current_process(process_id);
             debug!(
                 "Exit pid={} tgid={} code={}",
                 payload.pid, process_id, payload.exit_code

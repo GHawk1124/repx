@@ -231,6 +231,17 @@ pub fn canonicalize_output_slice(
         }
     }
 
+    eprintln!(
+        "DEBUG SLICE post-scan: wbp={} wbh={} flows={} pending_writes_left={}",
+        writers_by_path.len(),
+        writers_by_hash.len(),
+        flows.len(),
+        pending_writes.len(),
+    );
+    for (path, writers) in &writers_by_path {
+        eprintln!("DEBUG SLICE   wbp['{}'] = {} writer(s)", path, writers.len());
+    }
+
     if output_hashes.is_empty() {
         return Ok(Vec::new());
     }
