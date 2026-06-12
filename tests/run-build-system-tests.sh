@@ -337,6 +337,7 @@ EOF
         cd "$workspace"
         mkdir -p dist
         GOCACHE="$gocache" GOMODCACHE="$gomodcache" GOTMPDIR="$gotmpdir" \
+            GOMAXPROCS=1 \
             go build -trimpath -buildvcs=false -ldflags='-buildid=' \
             -o dist/hello .
         rm -rf dist "$gotmpdir"
@@ -346,7 +347,7 @@ EOF
     run_repx_case \
         "go" \
         "$workspace" \
-        "GOCACHE='$gocache' GOMODCACHE='$gomodcache' GOTMPDIR='$gotmpdir' go build -trimpath -buildvcs=false -ldflags='-buildid=' -o dist/hello ." \
+        "GOCACHE='$gocache' GOMODCACHE='$gomodcache' GOTMPDIR='$gotmpdir' GOMAXPROCS=1 go build -trimpath -buildvcs=false -ldflags='-buildid=' -o dist/hello ." \
         "test \"\$(./dist/hello)\" = 'go add=13 multiply=42'" \
         "rm -rf dist '$gocache' '$gotmpdir' && cp -a '$gocache_baseline' '$gocache' && mkdir -p '$gotmpdir'"
 }
