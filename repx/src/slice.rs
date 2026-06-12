@@ -32,6 +32,7 @@ pub fn canonicalize_output_slice(
     let mut writers_by_path: HashMap<String, HashSet<ProcessInstance>> = HashMap::new();
     let mut output_hashes: HashSet<String> = outputs.iter().map(|out| out.hash.clone()).collect();
     let mut root_exit = None;
+    let mut rename_pairs: Vec<(String, String)> = Vec::new();
 
     for event in events {
         match event {
@@ -180,13 +181,25 @@ pub fn canonicalize_output_slice(
                     writers_by_path.entry(path).or_default().extend(writers);
                 }
 
+                // Always attribute the final path to the renamer — even when
+                // the observation doesn't carry a content hash, this process
+                // is responsible for the file appearing at `to_path`.
+                writers_by_path
+                    .entry(to_path.clone())
+                    .or_default()
+                    .insert(process);
+
+                // Record the rename pair so a post-scan fixup can re-apply
+                // path aliasing for writes that arrived after the rename
+                // (reordered by parallel CPU ring-buffer submissions).
+                rename_pairs.push((from_path.clone(), to_path.clone()));
+
                 if let Some(hash) = observation.content_hash() {
                     let hash = hash.to_string();
                     let flow = flows.entry(process).or_default();
                     flow.reads.insert(hash.clone());
                     flow.renames.insert(hash.clone());
                     writers_by_hash.entry(hash).or_default().insert(process);
-                    writers_by_path.entry(to_path).or_default().insert(process);
                 }
             }
             TracedEvent::FileUnlink { .. } => {}
@@ -195,6 +208,26 @@ pub fn canonicalize_output_slice(
                     root_exit = Some((process, exit_code));
                 }
             }
+        }
+    }
+
+    // --- Post-scan rename fixup -------------------------------------------
+    //
+    // In parallel builds, rename events can arrive before the close events
+    // for writes to the old path (per-CPU ring-buffer submissions are not
+    // globally ordered).  Re-apply every rename alias now that all writes
+    // have been recorded so late-arriving writers are still attributed to
+    // the final output path.
+    for (from_path, to_path) in &rename_pairs {
+        let aliases: Vec<(String, HashSet<ProcessInstance>)> = writers_by_path
+            .iter()
+            .filter_map(|(path, writers)| {
+                rewrite_path_prefix(path, from_path, to_path)
+                    .map(|rewritten| (rewritten, writers.clone()))
+            })
+            .collect();
+        for (path, writers) in aliases {
+            writers_by_path.entry(path).or_default().extend(writers);
         }
     }
 
@@ -778,6 +811,94 @@ mod tests {
                 && op.tool_hash.as_ref() == Some(&renamer_tool_hash)
                 && op.output_hashes == vec![output_hash.clone()]
         }));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_attribution_survives_reordered_events() {
+        // Parallel builds can deliver rename events before the close events
+        // for writes to the old path (per-CPU ring-buffer submissions are
+        // not globally ordered).  The post-scan fixup must still attribute
+        // the write to the final output path.
+        let dir = unique_dir("rename-reorder");
+        fs::create_dir_all(&dir).unwrap();
+        let writer_tool = dir.join("writer");
+        let renamer_tool = dir.join("renamer");
+        let output = dir.join("output");
+        let temp = dir.join("output.tmp");
+
+        fs::write(&writer_tool, b"writer").unwrap();
+        fs::write(&renamer_tool, b"renamer").unwrap();
+        fs::write(&output, b"content").unwrap();
+        let output_hash = hash_file_contents(&output).unwrap();
+        let writer_tool_hash = hash_file_contents(&writer_tool).unwrap();
+        let content = FileObservation::Content(output_hash.clone());
+
+        let writer = ProcessInstance::test(10);
+        let renamer = ProcessInstance::test(11);
+
+        // Simulate the reordered case: rename arrives BEFORE the close
+        // that records the writer in writers_by_path.
+        let ops = canonicalize_output_slice(
+            vec![
+                TracedEvent::Exec {
+                    process: writer,
+                    observation: observe_path(&writer_tool.to_string_lossy()),
+                },
+                TracedEvent::Exec {
+                    process: renamer,
+                    observation: observe_path(&renamer_tool.to_string_lossy()),
+                },
+                // Rename fires first (e.g., from a different CPU).
+                TracedEvent::FileRename {
+                    process: renamer,
+                    from_path: temp.to_string_lossy().into_owned(),
+                    to_path: output.to_string_lossy().into_owned(),
+                    flags: 0,
+                    external: false,
+                    observation: content.clone(),
+                },
+                // Close arrives later.
+                TracedEvent::FileOpen {
+                    process: writer,
+                    path: temp.to_string_lossy().into_owned(),
+                    flags: 1,
+                    fd: 3,
+                    external: false,
+                    observation: content.clone(),
+                },
+                TracedEvent::FileClose {
+                    process: writer,
+                    fd: 3,
+                    path: Some(temp.to_string_lossy().into_owned()),
+                    external: false,
+                    observation: Some(content),
+                },
+            ],
+            writer,
+            &[OutputFile {
+                path: output.to_string_lossy().into_owned(),
+                hash: output_hash.clone(),
+            }],
+        )
+        .unwrap();
+
+        // No orphan sentinel.
+        for op in &ops {
+            assert_ne!(
+                op.process_index, u32::MAX,
+                "orphan op {:?} after reordered rename",
+                op.op_type
+            );
+        }
+
+        // The original writer must still be attributed.
+        assert!(ops.iter().any(|op| {
+            op.op_type == OpType::FileWrite
+                && op.tool_hash.as_ref() == Some(&writer_tool_hash)
+                && op.output_hashes == vec![output_hash.clone()]
+        }));
+
         let _ = fs::remove_dir_all(&dir);
     }
 
