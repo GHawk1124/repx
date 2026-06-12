@@ -774,16 +774,30 @@ fn process_buffered_events(
     state: &mut EventCollectorState,
     watch_prefixes: &[String],
 ) {
+    let mut raw_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (_, data) in raw_events {
         if data.len() < std::mem::size_of::<Event>() {
             state.malformed_events = state.malformed_events.saturating_add(1);
             continue;
         }
         let event = unsafe { (data.as_ptr() as *const Event).read_unaligned() };
+        let kind_str = match EventKind::try_from(event.kind) {
+            Ok(k) => format!("{:?}", k),
+            Err(_) => format!("unknown({})", event.kind),
+        };
+        let src_str = if event.source == 0 { "tracked" } else { "watch" };
+        *raw_counts.entry(format!("{}/{}", kind_str, src_str)).or_default() += 1;
         if !process_event(&event, events, state, watch_prefixes) {
             state.malformed_events = state.malformed_events.saturating_add(1);
         }
     }
+    eprintln!("DEBUG TRACER raw event counts: {:?}", raw_counts);
+    eprintln!(
+        "DEBUG TRACER traced events: {} total, {} fd_table entries left, {} processes tracked",
+        events.len(),
+        state.fd_table.len(),
+        state.current_processes.len(),
+    );
 }
 
 fn collect_events(
