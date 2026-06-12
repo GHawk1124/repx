@@ -867,7 +867,10 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
 
 // ---------------------------------------------------------------------------
 // Tracepoint: sched_process_fork
-// Track children of tracked processes.
+// Emit ProcessFork events for the process tree.
+// Tracking is handled by sys_exit_clone / sys_exit_clone3, which read the
+// child PID from the syscall return value (more reliable across kernel
+// versions than sched_process_fork's tracepoint data offset).
 // ---------------------------------------------------------------------------
 #[tracepoint]
 pub fn repx_fork(ctx: TracePointContext) -> u32 {
@@ -903,6 +906,53 @@ fn try_fork(ctx: &TracePointContext) -> Result<u32, i64> {
         entry.submit(0);
     } else {
         record_drop();
+    }
+
+    // Primary tracking via sys_exit_clone/sys_exit_clone3 is more reliable
+    // (the clone return value is child PID), but keep the fork-handler
+    // track_pid as a fallback for kernels that disable syscall tracepoints.
+    track_pid(child_pid);
+
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// Tracepoints: sys_exit_clone / sys_exit_clone3
+// Reliably track child processes via the clone syscall return value.
+// The sched_process_fork tracepoint data offset for child_pid varies
+// unpredictably across kernel builds (padding, config, arch);
+// syscall exit tracepoint formats are arch-stable kernel ABI.
+// ---------------------------------------------------------------------------
+#[tracepoint]
+pub fn repx_clone_exit(ctx: TracePointContext) -> u32 {
+    match try_clone_exit(&ctx) {
+        Ok(_) | Err(_) => 0,
+    }
+}
+
+#[tracepoint]
+pub fn repx_clone3_exit(ctx: TracePointContext) -> u32 {
+    match try_clone_exit(&ctx) {
+        Ok(_) | Err(_) => 0,
+    }
+}
+
+fn try_clone_exit(ctx: &TracePointContext) -> Result<u32, i64> {
+    // sys_exit_clone / sys_exit_clone3 layout (x86-64):
+    //   offset  8: __syscall_nr (int, 4 bytes + 4 pad)
+    //   offset 16: ret          (long, 8 bytes)
+    // ret > 0  → parent context, value is child pid.
+    // ret == 0 → child context  (already tracked via parent).
+    // ret < 0  → syscall error.
+    let ret: i64 = unsafe { ctx.read_at::<i64>(16)? };
+    if ret <= 0 {
+        return Ok(0);
+    }
+    let child_pid = ret as u32;
+
+    let parent_pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if !is_tracked(parent_pid) {
+        return Ok(0);
     }
 
     track_pid(child_pid);

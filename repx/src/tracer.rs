@@ -230,6 +230,22 @@ pub fn trace_command(command: &[String], watch_dirs: &[PathBuf]) -> Result<Trace
     attach_tracepoint(&mut bpf, "repx_exec", "sched", "sched_process_exec")?;
     attach_tracepoint(&mut bpf, "repx_fork", "sched", "sched_process_fork")?;
     attach_tracepoint(&mut bpf, "repx_exit", "sched", "sched_process_exit")?;
+    // Reliably track child PIDs from the clone syscall return value.
+    // sched_process_fork's tracepoint data offset for child_pid varies across
+    // kernel builds; syscall exit tracepoints are arch-stable kernel ABI.
+    // Attach best-effort: hardened kernels may disable syscall tracepoints,
+    // in which case we fall back to sched_process_fork-based tracking.
+    if let Err(e) =
+        attach_tracepoint(&mut bpf, "repx_clone_exit", "syscalls", "sys_exit_clone")
+    {
+        warn!("sys_exit_clone not available: {e}");
+    }
+    // clone3 (Linux 5.3+) may not exist on older kernels.
+    if let Err(e) =
+        attach_tracepoint(&mut bpf, "repx_clone3_exit", "syscalls", "sys_exit_clone3")
+    {
+        warn!("sys_exit_clone3 not available (expected on older kernels): {e}");
+    }
 
     // Populate watch-mode maps before spawning so sibling writes cannot race
     // the userspace arm step.
