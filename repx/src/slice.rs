@@ -246,6 +246,11 @@ pub fn canonicalize_output_slice(
                     queue.push_back(*process);
                 }
             }
+        } else {
+            eprintln!(
+                "DEBUG BFS: output path not in writers_by_path: {}",
+                output.path,
+            );
         }
     }
 
@@ -374,6 +379,33 @@ pub fn canonicalize_output_slice(
             }
         }
         if !attributed {
+            eprintln!(
+                "DEBUG orphan: hash={} in_wh={} wbp={} out_paths={:?}",
+                orphan_hash,
+                writers_by_hash.contains_key(&orphan_hash),
+                writers_by_path.len(),
+                outputs.iter().map(|o| &o.path).collect::<Vec<_>>(),
+            );
+            // Log matching paths in writers_by_path
+            for output in outputs {
+                eprintln!(
+                    "DEBUG output path={} (exists in wbp: {})",
+                    output.path,
+                    writers_by_path.contains_key(&output.path),
+                );
+                for (wbp_path, writers) in &writers_by_path {
+                    if wbp_path.ends_with(&output.path)
+                        || output.path.ends_with(wbp_path)
+                        || wbp_path == &output.path
+                    {
+                        eprintln!(
+                            "DEBUG   wbp['{}'] = {} writer(s)",
+                            wbp_path,
+                            writers.len(),
+                        );
+                    }
+                }
+            }
             ops.push(CanonicalOp {
                 op_type: OpType::FileWrite,
                 process_index: u32::MAX,
