@@ -30,7 +30,7 @@ jobs:
       - name: Build repx
         run: nix build
       - name: Smoke determinism harness (20 runs)
-        run: sudo --preserve-env=PATH nix run .#test-determinism -- smoke
+        run: sudo "$(command -v nix)" run .#test-determinism -- smoke
 
   # Build-system matrix determinism: Make, CMake/Ninja, Cargo, Go (20 runs each).
   harness-build-systems:
@@ -41,8 +41,8 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
       - name: Build repx
         run: nix build
-      - name: Build-system determinism harness (20 runs each)
-        run: sudo --preserve-env=PATH nix run .#test-determinism -- build-systems
+      - name: Build-system determinism harness (20 runs)
+        run: sudo "$(command -v nix)" run .#test-determinism -- build-systems
 
   # Nix-build determinism: trace a nix-build invocation 20 times.
   harness-nix-build:
@@ -54,4 +54,4 @@ jobs:
       - name: Build repx
         run: nix build
       - name: Nix-build determinism harness (20 runs)
-        run: sudo --preserve-env=PATH nix run .#test-determinism -- nix-build
+        run: sudo "$(command -v nix)" run .#test-determinism -- nix-build
