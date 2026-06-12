@@ -62,6 +62,25 @@ pub enum TracedEvent {
         /// File identity captured when the mapping event arrived.
         observation: Option<FileObservation>,
     },
+    FileRename {
+        pid: u32,
+        from_path: String,
+        to_path: String,
+        flags: u32,
+        /// True if this event came from a non-fork-tree process.
+        external: bool,
+        /// Identity observed at the destination after the rename completed.
+        observation: FileObservation,
+    },
+    FileUnlink {
+        pid: u32,
+        path: String,
+        flags: u32,
+        /// True if this event came from a non-fork-tree process.
+        external: bool,
+        /// Best available identity for the removed path.
+        observation: FileObservation,
+    },
     Exit {
         pid: u32,
         exit_code: i32,
@@ -119,6 +138,56 @@ pub fn trace_command(command: &[String], watch_dirs: &[PathBuf]) -> Result<Trace
         "sys_enter_openat",
     )?;
     attach_tracepoint(&mut bpf, "repx_openat_exit", "syscalls", "sys_exit_openat")?;
+    attach_tracepoint(
+        &mut bpf,
+        "repx_rename_enter",
+        "syscalls",
+        "sys_enter_rename",
+    )?;
+    attach_tracepoint(&mut bpf, "repx_rename_exit", "syscalls", "sys_exit_rename")?;
+    attach_tracepoint(
+        &mut bpf,
+        "repx_renameat_enter",
+        "syscalls",
+        "sys_enter_renameat",
+    )?;
+    attach_tracepoint(
+        &mut bpf,
+        "repx_renameat_exit",
+        "syscalls",
+        "sys_exit_renameat",
+    )?;
+    attach_tracepoint(
+        &mut bpf,
+        "repx_renameat2_enter",
+        "syscalls",
+        "sys_enter_renameat2",
+    )?;
+    attach_tracepoint(
+        &mut bpf,
+        "repx_renameat2_exit",
+        "syscalls",
+        "sys_exit_renameat2",
+    )?;
+    attach_tracepoint(
+        &mut bpf,
+        "repx_unlink_enter",
+        "syscalls",
+        "sys_enter_unlink",
+    )?;
+    attach_tracepoint(&mut bpf, "repx_unlink_exit", "syscalls", "sys_exit_unlink")?;
+    attach_tracepoint(
+        &mut bpf,
+        "repx_unlinkat_enter",
+        "syscalls",
+        "sys_enter_unlinkat",
+    )?;
+    attach_tracepoint(
+        &mut bpf,
+        "repx_unlinkat_exit",
+        "syscalls",
+        "sys_exit_unlinkat",
+    )?;
     attach_tracepoint(&mut bpf, "repx_close_enter", "syscalls", "sys_enter_close")?;
     attach_tracepoint(&mut bpf, "repx_mmap_enter", "syscalls", "sys_enter_mmap")?;
     attach_tracepoint(&mut bpf, "repx_exec", "sched", "sched_process_exec")?;
@@ -175,16 +244,14 @@ pub fn trace_command(command: &[String], watch_dirs: &[PathBuf]) -> Result<Trace
     let ring_buf = RingBuf::try_from(bpf.map_mut("EVENTS").unwrap())?;
 
     // Track fd -> path mapping per process for resolving closes.
-    let mut fd_table: HashMap<(u32, i32), OpenFileState> = HashMap::new();
-    let mut malformed_events = 0u64;
+    let mut collector_state = EventCollectorState::default();
 
     collect_events(
         ring_buf,
         child_pid,
         &mut events,
-        &mut fd_table,
+        &mut collector_state,
         &watch_prefixes,
-        &mut malformed_events,
     )?;
 
     // Use a single userspace-authored root Exec op. This avoids the original
@@ -206,7 +273,7 @@ pub fn trace_command(command: &[String], watch_dirs: &[PathBuf]) -> Result<Trace
         drop_count
             .get(&0u32, 0)
             .unwrap_or(0)
-            .saturating_add(malformed_events)
+            .saturating_add(collector_state.malformed_events)
     };
 
     if dropped_events > 0 {
@@ -290,7 +357,7 @@ fn resolve_executable(command: &str) -> String {
 fn process_event(
     event: &Event,
     events: &mut Vec<TracedEvent>,
-    fd_table: &mut HashMap<(u32, i32), OpenFileState>,
+    state: &mut EventCollectorState,
     watch_prefixes: &[String],
 ) -> bool {
     let Ok(kind) = EventKind::try_from(event.kind) else {
@@ -340,14 +407,14 @@ fn process_event(
                 &path
             };
             let handle = open_regular(handle_path).ok().flatten();
-            let mut state = OpenFileState {
+            let mut open_state = OpenFileState {
                 path,
                 handle,
                 flags: payload.flags,
                 open_observation: None,
             };
-            let observation = state.open_observation();
-            let event_path = state.path.clone();
+            let observation = open_state.open_observation();
+            let event_path = open_state.path.clone();
 
             debug!(
                 "FileOpen pid={} tgid={} fd={} dfd={} path={} flags={} external={}",
@@ -355,14 +422,14 @@ fn process_event(
                 process_id,
                 payload.fd,
                 payload.dfd,
-                state.path,
+                open_state.path,
                 payload.flags,
                 external
             );
 
             // Track this fd for later close resolution.
             if payload.fd >= 0 {
-                fd_table.insert((process_id, payload.fd), state);
+                state.fd_table.insert((process_id, payload.fd), open_state);
             }
 
             events.push(TracedEvent::FileOpen {
@@ -378,12 +445,14 @@ fn process_event(
             let payload = unsafe { &event.payload.file_close };
             let external = event.source == 1;
             let process_id = payload.tgid;
-            let mut state = fd_table.remove(&(process_id, payload.fd));
-            if external && state.is_none() {
+            let mut open_state = state.fd_table.remove(&(process_id, payload.fd));
+            if external && open_state.is_none() {
                 return true;
             }
-            let observation = state.as_mut().and_then(OpenFileState::close_observation);
-            let path = state.map(|state| state.path);
+            let observation = open_state
+                .as_mut()
+                .and_then(OpenFileState::close_observation);
+            let path = open_state.map(|state| state.path);
 
             debug!(
                 "FileClose pid={} tgid={} fd={} path={:?} external={}",
@@ -403,7 +472,7 @@ fn process_event(
             let external = event.source == 1;
             let process_id = payload.tgid;
 
-            let (path, observation) = match fd_table.get_mut(&(process_id, payload.fd)) {
+            let (path, observation) = match state.fd_table.get_mut(&(process_id, payload.fd)) {
                 Some(state) => (Some(state.path.clone()), Some(state.mmap_observation())),
                 None if external => return true,
                 None => (None, None),
@@ -420,6 +489,114 @@ fn process_event(
                 prot: payload.prot,
                 flags: payload.flags,
                 path,
+                external,
+                observation,
+            });
+        }
+        EventKind::FileRenameSource => {
+            let payload = unsafe { &event.payload.file_path };
+            let process_id = payload.tgid;
+            let Some(raw_path) = decode_event_path(&payload.path, payload.path_len) else {
+                return false;
+            };
+            let path = resolve_open_path(process_id, payload.dfd, &raw_path);
+            state.pending_renames.insert(
+                (payload.pid, payload.operation_id),
+                PendingRename {
+                    pid: process_id,
+                    from_path: path,
+                    flags: payload.flags,
+                    external: event.source == 1,
+                },
+            );
+        }
+        EventKind::FileRenameDestination => {
+            let payload = unsafe { &event.payload.file_path };
+            let process_id = payload.tgid;
+            let Some(pending) = state
+                .pending_renames
+                .remove(&(payload.pid, payload.operation_id))
+            else {
+                warn!(
+                    "Rename destination without source pid={} operation={}",
+                    payload.pid, payload.operation_id
+                );
+                return false;
+            };
+            let Some(raw_path) = decode_event_path(&payload.path, payload.path_len) else {
+                return false;
+            };
+            let to_path = resolve_open_path(process_id, payload.dfd, &raw_path);
+            let external = pending.external || event.source == 1;
+            if external
+                && !watch_prefixes.iter().any(|prefix| {
+                    is_path_within(&pending.from_path, prefix) || is_path_within(&to_path, prefix)
+                })
+            {
+                return true;
+            }
+
+            rewrite_open_file_paths(
+                &mut state.fd_table,
+                &pending.from_path,
+                &to_path,
+                pending.flags,
+            );
+            let observation = observe_path(&to_path);
+            let reverse_observation =
+                (pending.flags & RENAME_EXCHANGE != 0).then(|| observe_path(&pending.from_path));
+            debug!(
+                "FileRename pid={} from={} to={} flags={:#x} external={}",
+                process_id, pending.from_path, to_path, pending.flags, external
+            );
+            events.push(TracedEvent::FileRename {
+                pid: pending.pid,
+                from_path: pending.from_path.clone(),
+                to_path: to_path.clone(),
+                flags: pending.flags,
+                external,
+                observation,
+            });
+            if let Some(observation) = reverse_observation {
+                events.push(TracedEvent::FileRename {
+                    pid: pending.pid,
+                    from_path: to_path,
+                    to_path: pending.from_path,
+                    flags: pending.flags,
+                    external,
+                    observation,
+                });
+            }
+        }
+        EventKind::FileUnlink => {
+            let payload = unsafe { &event.payload.file_path };
+            let process_id = payload.tgid;
+            let Some(raw_path) = decode_event_path(&payload.path, payload.path_len) else {
+                return false;
+            };
+            let path = resolve_open_path(process_id, payload.dfd, &raw_path);
+            let external = event.source == 1;
+            if external
+                && !watch_prefixes
+                    .iter()
+                    .any(|prefix| is_path_within(&path, prefix))
+            {
+                return true;
+            }
+            let observation = state
+                .fd_table
+                .values_mut()
+                .find(|state| state.path == path)
+                .map(OpenFileState::observe_current)
+                .unwrap_or_else(|| observe_path(&path));
+            debug!(
+                "FileUnlink pid={} path={} flags={:#x} external={}",
+                process_id, path, payload.flags, external
+            );
+            events.push(TracedEvent::FileUnlink {
+                pid: process_id,
+                path,
+                flags: payload.flags,
                 external,
                 observation,
             });
@@ -488,9 +665,8 @@ fn collect_events(
     mut ring_buf: RingBuf<&mut aya::maps::MapData>,
     child_pid: u32,
     events: &mut Vec<TracedEvent>,
-    fd_table: &mut HashMap<(u32, i32), OpenFileState>,
+    state: &mut EventCollectorState,
     watch_prefixes: &[String],
-    malformed_events: &mut u64,
 ) -> Result<()> {
     loop {
         // Poll the ring buffer.
@@ -498,13 +674,13 @@ fn collect_events(
             let data = item.as_ref();
             if data.len() < std::mem::size_of::<Event>() {
                 warn!("Short event: {} bytes", data.len());
-                *malformed_events = malformed_events.saturating_add(1);
+                state.malformed_events = state.malformed_events.saturating_add(1);
                 continue;
             }
 
             let event = unsafe { (data.as_ptr() as *const Event).read_unaligned() };
-            if !process_event(&event, events, fd_table, watch_prefixes) {
-                *malformed_events = malformed_events.saturating_add(1);
+            if !process_event(&event, events, state, watch_prefixes) {
+                state.malformed_events = state.malformed_events.saturating_add(1);
             }
         }
 
@@ -517,9 +693,8 @@ fn collect_events(
                     child_pid,
                     real_exit_code,
                     events,
-                    fd_table,
+                    state,
                     watch_prefixes,
-                    malformed_events,
                 )?;
                 break;
             }
@@ -531,9 +706,8 @@ fn collect_events(
                     child_pid,
                     real_exit_code,
                     events,
-                    fd_table,
+                    state,
                     watch_prefixes,
-                    malformed_events,
                 )?;
                 break;
             }
@@ -552,9 +726,8 @@ fn finish_child_exit(
     child_pid: u32,
     real_exit_code: i32,
     events: &mut Vec<TracedEvent>,
-    fd_table: &mut HashMap<(u32, i32), OpenFileState>,
+    state: &mut EventCollectorState,
     watch_prefixes: &[String],
-    malformed_events: &mut u64,
 ) -> Result<()> {
     // Allow a short quiescence window for sibling watch-mode events that race
     // with the traced child's exit.
@@ -569,13 +742,13 @@ fn finish_child_exit(
             let data = item.as_ref();
             if data.len() >= std::mem::size_of::<Event>() {
                 let event = unsafe { (data.as_ptr() as *const Event).read_unaligned() };
-                if !process_event(&event, events, fd_table, watch_prefixes) {
-                    *malformed_events = malformed_events.saturating_add(1);
+                if !process_event(&event, events, state, watch_prefixes) {
+                    state.malformed_events = state.malformed_events.saturating_add(1);
                 }
                 saw_event = true;
             } else {
                 warn!("Short event: {} bytes", data.len());
-                *malformed_events = malformed_events.saturating_add(1);
+                state.malformed_events = state.malformed_events.saturating_add(1);
             }
         }
 
@@ -612,6 +785,17 @@ fn finish_child_exit(
         });
     }
 
+    if !state.pending_renames.is_empty() {
+        warn!(
+            "{} rename operations were missing a paired path event",
+            state.pending_renames.len()
+        );
+        state.malformed_events = state
+            .malformed_events
+            .saturating_add(state.pending_renames.len() as u64);
+        state.pending_renames.clear();
+    }
+
     Ok(())
 }
 
@@ -626,6 +810,20 @@ fn wait_for_ring_event(ring_buf: &RingBuf<&mut aya::maps::MapData>, timeout_ms: 
         return Err(std::io::Error::last_os_error()).context("Failed polling eBPF ring buffer");
     }
     Ok(())
+}
+
+struct PendingRename {
+    pid: u32,
+    from_path: String,
+    flags: u32,
+    external: bool,
+}
+
+#[derive(Default)]
+struct EventCollectorState {
+    fd_table: HashMap<(u32, i32), OpenFileState>,
+    pending_renames: HashMap<(u32, u64), PendingRename>,
+    malformed_events: u64,
 }
 
 struct OpenFileState {
@@ -660,6 +858,49 @@ impl OpenFileState {
         let can_write = (self.flags & 0x3) != 0;
         can_write.then(|| self.observe_current())
     }
+}
+
+const RENAME_EXCHANGE: u32 = 1 << 1;
+
+fn decode_event_path(path: &[u8], path_len: u32) -> Option<String> {
+    let path_len = (path_len as usize).min(path.len());
+    std::str::from_utf8(&path[..path_len])
+        .ok()
+        .map(|path| path.trim_end_matches('\0').to_string())
+        .filter(|path| !path.is_empty())
+}
+
+fn rewrite_open_file_paths(
+    fd_table: &mut HashMap<(u32, i32), OpenFileState>,
+    from_path: &str,
+    to_path: &str,
+    flags: u32,
+) {
+    for state in fd_table.values_mut() {
+        let original = state.path.clone();
+        let replacement = rewrite_path_prefix(&original, from_path, to_path).or_else(|| {
+            if flags & RENAME_EXCHANGE != 0 {
+                rewrite_path_prefix(&original, to_path, from_path)
+            } else {
+                None
+            }
+        });
+        if let Some(replacement) = replacement {
+            state.path = replacement;
+        }
+    }
+}
+
+fn rewrite_path_prefix(path: &str, from_path: &str, to_path: &str) -> Option<String> {
+    if path == from_path {
+        return Some(to_path.to_string());
+    }
+
+    let suffix = path.strip_prefix(from_path)?;
+    if !suffix.starts_with('/') {
+        return None;
+    }
+    Some(format!("{to_path}{suffix}"))
 }
 
 fn resolve_open_path(tgid: u32, dfd: i32, raw_path: &str) -> String {
@@ -766,5 +1007,54 @@ mod tests {
             "relative/output.o",
             "/tmp/build/relative/output.o"
         ));
+    }
+
+    #[test]
+    fn rename_rewrites_open_file_paths_at_directory_boundaries() {
+        let mut fd_table = HashMap::new();
+        fd_table.insert(
+            (1, 3),
+            OpenFileState {
+                path: "/tmp/old/artifact".to_string(),
+                handle: None,
+                flags: 1,
+                open_observation: None,
+            },
+        );
+        fd_table.insert(
+            (1, 4),
+            OpenFileState {
+                path: "/tmp/older/unrelated".to_string(),
+                handle: None,
+                flags: 1,
+                open_observation: None,
+            },
+        );
+
+        rewrite_open_file_paths(&mut fd_table, "/tmp/old", "/tmp/new", 0);
+
+        assert_eq!(fd_table[&(1, 3)].path, "/tmp/new/artifact");
+        assert_eq!(fd_table[&(1, 4)].path, "/tmp/older/unrelated");
+    }
+
+    #[test]
+    fn exchange_rename_swaps_open_file_paths() {
+        let mut fd_table = HashMap::new();
+        for (fd, path) in [(3, "/tmp/left"), (4, "/tmp/right")] {
+            fd_table.insert(
+                (1, fd),
+                OpenFileState {
+                    path: path.to_string(),
+                    handle: None,
+                    flags: 1,
+                    open_observation: None,
+                },
+            );
+        }
+
+        rewrite_open_file_paths(&mut fd_table, "/tmp/left", "/tmp/right", RENAME_EXCHANGE);
+
+        assert_eq!(fd_table[&(1, 3)].path, "/tmp/right");
+        assert_eq!(fd_table[&(1, 4)].path, "/tmp/left");
     }
 }

@@ -112,7 +112,7 @@ Mechanism & Current status \\
 \midrule
 \texttt{openat}, \texttt{close}, file-backed \texttt{mmap} & Covered; \texttt{O\_RDWR} is modeled as both read and write. Writable private mappings are reads, while only writable \texttt{MAP\_SHARED} mappings are writes. \\
 \texttt{open}, \texttt{openat2} & Not traced. \\
-\texttt{rename}, \texttt{unlink} & Not modeled as operations; temp-file replacement can escape write attribution. \\
+\texttt{rename*}, \texttt{unlink*} & Successful operations are traced. Descriptor paths and output-slice writer aliases follow final rename destinations; deletion remains a distinct operation. \\
 \texttt{dup*}, inherited descriptors & Descriptor attribution is incomplete. \\
 \texttt{sendfile}, \texttt{copy\_file\_range}, \texttt{io\_uring} & Not traced. \\
 Network I/O & Not traced; remote scripts or data are outside the commitment unless they also appear through a covered file access. \\

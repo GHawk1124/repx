@@ -29,6 +29,12 @@ pub enum EventKind {
     ProcessExit = 4,
     /// A file was memory-mapped (captures fd + prot + flags).
     FileMmap = 5,
+    /// Source path of a successful rename operation.
+    FileRenameSource = 6,
+    /// Destination path of a successful rename operation.
+    FileRenameDestination = 7,
+    /// A path was successfully unlinked.
+    FileUnlink = 8,
 }
 
 impl TryFrom<u32> for EventKind {
@@ -41,6 +47,9 @@ impl TryFrom<u32> for EventKind {
             3 => Ok(Self::ProcessExec),
             4 => Ok(Self::ProcessExit),
             5 => Ok(Self::FileMmap),
+            6 => Ok(Self::FileRenameSource),
+            7 => Ok(Self::FileRenameDestination),
+            8 => Ok(Self::FileUnlink),
             _ => Err(()),
         }
     }
@@ -121,6 +130,27 @@ pub struct FileMmapEvent {
     pub flags: u32,
 }
 
+/// One pathname participating in a filesystem mutation. Rename operations
+/// emit two events with the same operation ID; unlink emits one.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FilePathEvent {
+    /// PID of the process.
+    pub pid: u32,
+    /// Thread group ID.
+    pub tgid: u32,
+    /// Directory fd for relative path resolution (AT_FDCWD = -100).
+    pub dfd: i32,
+    /// Rename or unlink flags.
+    pub flags: u32,
+    /// Correlates the source and destination halves of a rename.
+    pub operation_id: u64,
+    /// Path supplied to the syscall.
+    pub path: [u8; MAX_PATH_LEN],
+    /// Actual length of the path before truncation.
+    pub path_len: u32,
+}
+
 /// A watched path prefix for system-wide file monitoring.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -151,6 +181,7 @@ pub union EventPayload {
     pub file_open: FileOpenEvent,
     pub file_close: FileCloseEvent,
     pub file_mmap: FileMmapEvent,
+    pub file_path: FilePathEvent,
     pub process_exec: ProcessExecEvent,
     pub process_exit: ProcessExitEvent,
     pub _pad: [u8; core::mem::size_of::<FileOpenEvent>()],

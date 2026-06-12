@@ -11,6 +11,7 @@ struct ProcessFlow {
     tool_hash: Option<String>,
     reads: HashSet<String>,
     writes: HashSet<String>,
+    renames: HashSet<String>,
 }
 
 pub fn canonicalize_output_slice(
@@ -94,6 +95,7 @@ pub fn canonicalize_output_slice(
             TracedEvent::FileClose {
                 pid,
                 fd,
+                path,
                 external,
                 observation,
                 ..
@@ -102,7 +104,9 @@ pub fn canonicalize_output_slice(
                     continue;
                 }
 
-                let write_path = pending_writes.remove(&(pid, fd));
+                let write_path = pending_writes
+                    .remove(&(pid, fd))
+                    .map(|pending_path| path.unwrap_or(pending_path));
                 if let (Some(path), Some(observation)) = (write_path, observation) {
                     writers_by_path.entry(path).or_default().insert(pid);
                     if let Some(hash) = observation.content_hash() {
@@ -112,6 +116,45 @@ pub fn canonicalize_output_slice(
                     }
                 }
             }
+            TracedEvent::FileRename {
+                pid,
+                from_path,
+                to_path,
+                external,
+                observation,
+                ..
+            } => {
+                if external {
+                    continue;
+                }
+
+                for path in pending_writes.values_mut() {
+                    if let Some(rewritten) = rewrite_path_prefix(path, &from_path, &to_path) {
+                        *path = rewritten;
+                    }
+                }
+
+                let aliases: Vec<(String, HashSet<u32>)> = writers_by_path
+                    .iter()
+                    .filter_map(|(path, writers)| {
+                        rewrite_path_prefix(path, &from_path, &to_path)
+                            .map(|rewritten| (rewritten, writers.clone()))
+                    })
+                    .collect();
+                for (path, writers) in aliases {
+                    writers_by_path.entry(path).or_default().extend(writers);
+                }
+
+                if let Some(hash) = observation.content_hash() {
+                    let hash = hash.to_string();
+                    let flow = flows.entry(pid).or_default();
+                    flow.reads.insert(hash.clone());
+                    flow.renames.insert(hash.clone());
+                    writers_by_hash.entry(hash).or_default().insert(pid);
+                    writers_by_path.entry(to_path).or_default().insert(pid);
+                }
+            }
+            TracedEvent::FileUnlink { .. } => {}
             TracedEvent::Exit { pid, exit_code } => {
                 if pid == root_pid {
                     root_exit_code = Some(exit_code);
@@ -202,6 +245,20 @@ pub fn canonicalize_output_slice(
                 });
             }
         }
+
+        for rename_hash in sorted_hashes(&flow.renames) {
+            if relevant_hashes.contains(&rename_hash) || output_hashes.contains(&rename_hash) {
+                output_hashes.remove(&rename_hash);
+                ops.push(CanonicalOp {
+                    op_type: OpType::FileRename,
+                    process_index: pid,
+                    tool_hash: flow.tool_hash.clone(),
+                    args: vec![],
+                    input_hashes: vec![rename_hash.clone()],
+                    output_hashes: vec![rename_hash],
+                });
+            }
+        }
     }
 
     for orphan_hash in sorted_hashes(&output_hashes) {
@@ -233,6 +290,16 @@ fn sorted_hashes(hashes: &HashSet<String>) -> Vec<String> {
     let mut values: Vec<String> = hashes.iter().cloned().collect();
     values.sort();
     values
+}
+
+fn rewrite_path_prefix(path: &str, from_path: &str, to_path: &str) -> Option<String> {
+    if path == from_path {
+        return Some(to_path.to_string());
+    }
+    let suffix = path.strip_prefix(from_path)?;
+    suffix
+        .starts_with('/')
+        .then(|| format!("{to_path}{suffix}"))
 }
 
 #[cfg(test)]
@@ -591,6 +658,75 @@ mod tests {
                 .iter()
                 .chain(&op.output_hashes)
                 .any(|hash| hash.starts_with("missing:"))
+        }));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_propagates_writer_to_final_output_path() {
+        let dir = unique_dir("rename-output");
+        fs::create_dir_all(&dir).unwrap();
+        let writer_tool = dir.join("writer-tool");
+        let renamer_tool = dir.join("renamer-tool");
+        let temporary = dir.join("artifact.tmp");
+        let output = dir.join("artifact");
+        fs::write(&writer_tool, b"writer").unwrap();
+        fs::write(&renamer_tool, b"renamer").unwrap();
+        fs::write(&output, b"artifact").unwrap();
+        let output_hash = hash_file_contents(&output).unwrap();
+        let content = FileObservation::Content(output_hash.clone());
+
+        let ops = canonicalize_output_slice(
+            vec![
+                TracedEvent::Exec {
+                    pid: 10,
+                    observation: observe_path(&writer_tool.to_string_lossy()),
+                },
+                TracedEvent::FileOpen {
+                    pid: 10,
+                    path: temporary.to_string_lossy().into_owned(),
+                    flags: 1,
+                    fd: 3,
+                    external: false,
+                    observation: content.clone(),
+                },
+                TracedEvent::FileClose {
+                    pid: 10,
+                    fd: 3,
+                    path: Some(temporary.to_string_lossy().into_owned()),
+                    external: false,
+                    observation: Some(content.clone()),
+                },
+                TracedEvent::Exec {
+                    pid: 11,
+                    observation: observe_path(&renamer_tool.to_string_lossy()),
+                },
+                TracedEvent::FileRename {
+                    pid: 11,
+                    from_path: temporary.to_string_lossy().into_owned(),
+                    to_path: output.to_string_lossy().into_owned(),
+                    flags: 0,
+                    external: false,
+                    observation: content,
+                },
+            ],
+            10,
+            &[OutputFile {
+                path: output.to_string_lossy().into_owned(),
+                hash: output_hash.clone(),
+            }],
+        )
+        .unwrap();
+
+        assert!(ops.iter().any(|op| {
+            op.op_type == OpType::FileWrite
+                && op.process_index == 10
+                && op.output_hashes == vec![output_hash.clone()]
+        }));
+        assert!(ops.iter().any(|op| {
+            op.op_type == OpType::FileRename
+                && op.process_index == 11
+                && op.output_hashes == vec![output_hash.clone()]
         }));
         let _ = fs::remove_dir_all(&dir);
     }

@@ -40,6 +40,10 @@ pub enum OpType {
     FileRead,
     /// File was written (output).
     FileWrite,
+    /// A file identity was moved to a new path.
+    FileRename,
+    /// A file path was removed.
+    FileDelete,
     /// System state was accessed (normalized).
     SystemStateRead,
     /// Process exited.
@@ -48,6 +52,10 @@ pub enum OpType {
     ExternalFileRead,
     /// File was written by an external (non-fork-tree) process touching a watched path.
     ExternalFileWrite,
+    /// File was renamed by an external process touching a watched path.
+    ExternalFileRename,
+    /// File was removed by an external process touching a watched path.
+    ExternalFileDelete,
 }
 
 impl CanonicalOp {
@@ -56,10 +64,14 @@ impl CanonicalOp {
             OpType::Exec => "exec",
             OpType::FileRead => "file_read",
             OpType::FileWrite => "file_write",
+            OpType::FileRename => "file_rename",
+            OpType::FileDelete => "file_delete",
             OpType::SystemStateRead => "system_state_read",
             OpType::Exit => "exit",
             OpType::ExternalFileRead => "external_file_read",
             OpType::ExternalFileWrite => "external_file_write",
+            OpType::ExternalFileRename => "external_file_rename",
+            OpType::ExternalFileDelete => "external_file_delete",
         }
     }
 
@@ -405,6 +417,89 @@ pub fn canonicalize_events(
                 }
             }
 
+            TracedEvent::FileRename {
+                pid,
+                from_path,
+                to_path,
+                flags,
+                external,
+                observation,
+            } => {
+                let fallback_external = !*external
+                    && *pid != root_pid
+                    && (is_watched_path(from_path, watch_prefixes)
+                        || is_watched_path(to_path, watch_prefixes))
+                    && (fallback_external_pids.contains(pid)
+                        || !pid_to_tool_hash.contains_key(pid));
+                let identity = observation.identity();
+                let args = vec![format!("flags:{flags:#x}")];
+
+                if *external || fallback_external {
+                    fallback_external_pids.insert(*pid);
+                    external_ops.push(CanonicalOp {
+                        op_type: OpType::ExternalFileRename,
+                        process_index: u32::MAX,
+                        tool_hash: None,
+                        args,
+                        input_hashes: vec![identity.clone()],
+                        output_hashes: vec![identity],
+                    });
+                } else {
+                    if !pid_to_index.contains_key(pid) {
+                        pid_to_index.insert(*pid, next_index);
+                        next_index += 1;
+                    }
+                    ops.push(CanonicalOp {
+                        op_type: OpType::FileRename,
+                        process_index: pid_to_index[pid],
+                        tool_hash: pid_to_tool_hash.get(pid).cloned(),
+                        args,
+                        input_hashes: vec![identity.clone()],
+                        output_hashes: vec![identity],
+                    });
+                }
+            }
+
+            TracedEvent::FileUnlink {
+                pid,
+                path,
+                flags,
+                external,
+                observation,
+            } => {
+                let fallback_external = !*external
+                    && *pid != root_pid
+                    && is_watched_path(path, watch_prefixes)
+                    && (fallback_external_pids.contains(pid)
+                        || !pid_to_tool_hash.contains_key(pid));
+                let args = vec![format!("flags:{flags:#x}")];
+
+                if *external || fallback_external {
+                    fallback_external_pids.insert(*pid);
+                    external_ops.push(CanonicalOp {
+                        op_type: OpType::ExternalFileDelete,
+                        process_index: u32::MAX,
+                        tool_hash: None,
+                        args,
+                        input_hashes: vec![observation.identity()],
+                        output_hashes: vec![],
+                    });
+                } else {
+                    if !pid_to_index.contains_key(pid) {
+                        pid_to_index.insert(*pid, next_index);
+                        next_index += 1;
+                    }
+                    ops.push(CanonicalOp {
+                        op_type: OpType::FileDelete,
+                        process_index: pid_to_index[pid],
+                        tool_hash: pid_to_tool_hash.get(pid).cloned(),
+                        args,
+                        input_hashes: vec![observation.identity()],
+                        output_hashes: vec![],
+                    });
+                }
+            }
+
             TracedEvent::Exit { pid, exit_code, .. } => {
                 if let Some(&proc_idx) = pid_to_index.get(pid) {
                     // Only include exit code for the root process, which
@@ -618,6 +713,43 @@ mod tests {
 
         assert!(ops.iter().any(|op| op.op_type == OpType::FileRead));
         assert!(!ops.iter().any(|op| op.op_type == OpType::FileWrite));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_and_unlink_are_distinct_operations() {
+        let dir = unique_test_dir("path-mutations");
+        std::fs::create_dir_all(&dir).unwrap();
+        let from = dir.join("artifact.tmp");
+        let to = dir.join("artifact");
+        std::fs::write(&to, b"artifact").unwrap();
+        let observation = observe_path(&to.to_string_lossy());
+
+        let ops = canonicalize_events(
+            vec![
+                TracedEvent::FileRename {
+                    pid: 1,
+                    from_path: from.to_string_lossy().into_owned(),
+                    to_path: to.to_string_lossy().into_owned(),
+                    flags: 0,
+                    external: false,
+                    observation: observation.clone(),
+                },
+                TracedEvent::FileUnlink {
+                    pid: 1,
+                    path: to.to_string_lossy().into_owned(),
+                    flags: 0,
+                    external: false,
+                    observation,
+                },
+            ],
+            1,
+            &[],
+        )
+        .unwrap();
+
+        assert!(ops.iter().any(|op| op.op_type == OpType::FileRename));
+        assert!(ops.iter().any(|op| op.op_type == OpType::FileDelete));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

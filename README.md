@@ -52,9 +52,9 @@ project's integration workload matrix.
 
 | Behavior | Status |
 | --- | --- |
-| `openat`, `close`, file-backed `mmap`, `exec`, fork, exit | Covered |
+| `openat`, `close`, file-backed `mmap`, `rename*`, `unlink*`, `exec`, fork, exit | Covered |
 | `open`, `openat2` | Not covered |
-| `rename`, `unlink`, temp-file replacement | Not modeled as operations |
+| Temp-file replacement | Final rename paths are attributed; rename and deletion are distinct operations |
 | `dup*`, inherited descriptors | Descriptor attribution incomplete |
 | `sendfile`, `copy_file_range`, `io_uring` | Not covered |
 | Network I/O and remote inputs | Not covered |

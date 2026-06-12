@@ -34,6 +34,16 @@ static ROOT_PID: HashMap<u32, u8> = HashMap::with_max_entries(1, 0);
 #[map]
 static OPENAT_STASH: HashMap<u64, OpenatStash> = HashMap::with_max_entries(4096, 0);
 
+/// Temporary storage for rename/unlink arguments until syscall completion.
+#[map]
+static PATH_OP_STASH: HashMap<u64, PathOpStash> = HashMap::with_max_entries(4096, 0);
+
+#[map]
+static PATH_OP_OLD_PATH: HashMap<u64, PathStash> = HashMap::with_max_entries(4096, 0);
+
+#[map]
+static PATH_OP_NEW_PATH: HashMap<u64, PathStash> = HashMap::with_max_entries(4096, 0);
+
 /// Counter for dropped events (ring buffer full). Keyed by 0, value is count.
 #[map]
 static DROP_COUNT: HashMap<u32, u64> = HashMap::with_max_entries(1, 0);
@@ -64,6 +74,27 @@ struct OpenatStash {
     path_len: u32,
     /// 0 = fork-tree tracked, 1 = watch-mode match from external process.
     from_watch: u8,
+}
+
+const PATH_OP_RENAME: u8 = 1;
+const PATH_OP_UNLINK: u8 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PathOpStash {
+    old_dfd: i32,
+    new_dfd: i32,
+    flags: u32,
+    operation: u8,
+    /// 0 = fork-tree tracked, 1 = watch-mode match from external process.
+    from_watch: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PathStash {
+    path: [u8; MAX_PATH_LEN],
+    path_len: u32,
 }
 
 #[inline(always)]
@@ -125,6 +156,204 @@ fn matches_watched_prefix(path: &[u8; MAX_PATH_LEN], path_len: u32) -> bool {
         }
     }
     result
+}
+
+#[inline(always)]
+fn path_is_absolute(path: &[u8; MAX_PATH_LEN], path_len: u32) -> bool {
+    path_len > 0 && path[0] == b'/'
+}
+
+#[inline(never)]
+fn stash_old_path(pid_tgid: u64, path_ptr: *const u8) -> Result<u32, i64> {
+    let mut path = PathStash {
+        path: [0u8; MAX_PATH_LEN],
+        path_len: 0,
+    };
+    if let Ok(bytes) = unsafe { bpf_probe_read_user_str_bytes(path_ptr, &mut path.path) } {
+        path.path_len = bytes.len() as u32;
+    }
+    if path.path_len == 0 {
+        record_drop();
+        return Ok(0);
+    }
+    if PATH_OP_OLD_PATH.insert(&pid_tgid, &path, 0).is_err() {
+        record_drop();
+        return Ok(0);
+    }
+    Ok(path.path_len)
+}
+
+#[inline(never)]
+fn stash_new_path(pid_tgid: u64, path_ptr: *const u8) -> Result<u32, i64> {
+    let mut path = PathStash {
+        path: [0u8; MAX_PATH_LEN],
+        path_len: 0,
+    };
+    if let Ok(bytes) = unsafe { bpf_probe_read_user_str_bytes(path_ptr, &mut path.path) } {
+        path.path_len = bytes.len() as u32;
+    }
+    if path.path_len == 0 {
+        record_drop();
+        return Ok(0);
+    }
+    if PATH_OP_NEW_PATH.insert(&pid_tgid, &path, 0).is_err() {
+        record_drop();
+        return Ok(0);
+    }
+    Ok(path.path_len)
+}
+
+#[inline(always)]
+fn remove_path_stash(pid_tgid: u64) {
+    let _ = PATH_OP_STASH.remove(&pid_tgid);
+    let _ = PATH_OP_OLD_PATH.remove(&pid_tgid);
+    let _ = PATH_OP_NEW_PATH.remove(&pid_tgid);
+}
+
+#[inline(always)]
+fn stash_rename(
+    pid_tgid: u64,
+    old_dfd: i32,
+    old_path_ptr: *const u8,
+    new_dfd: i32,
+    new_path_ptr: *const u8,
+    flags: u32,
+) -> Result<u32, i64> {
+    let tgid = (pid_tgid >> 32) as u32;
+    let tracked = is_tracked(tgid);
+    if !tracked && unsafe { WATCH_MODE.get(&0u32) }.copied().unwrap_or(0) == 0 {
+        return Ok(0);
+    }
+    let stash = PathOpStash {
+        old_dfd,
+        new_dfd,
+        flags,
+        operation: PATH_OP_RENAME,
+        from_watch: if tracked { 0 } else { 1 },
+    };
+    let old_path_len = stash_old_path(pid_tgid, old_path_ptr)?;
+    let new_path_len = stash_new_path(pid_tgid, new_path_ptr)?;
+    if old_path_len == 0 || new_path_len == 0 {
+        remove_path_stash(pid_tgid);
+        return Ok(0);
+    }
+
+    let old_path = match unsafe { PATH_OP_OLD_PATH.get(&pid_tgid) } {
+        Some(path) => path,
+        None => {
+            record_drop();
+            remove_path_stash(pid_tgid);
+            return Ok(0);
+        }
+    };
+    let new_path = match unsafe { PATH_OP_NEW_PATH.get(&pid_tgid) } {
+        Some(path) => path,
+        None => {
+            record_drop();
+            remove_path_stash(pid_tgid);
+            return Ok(0);
+        }
+    };
+
+    if !tracked {
+        let both_absolute = path_is_absolute(&old_path.path, old_path.path_len)
+            && path_is_absolute(&new_path.path, new_path.path_len);
+        if both_absolute
+            && !matches_watched_prefix(&old_path.path, old_path.path_len)
+            && !matches_watched_prefix(&new_path.path, new_path.path_len)
+        {
+            remove_path_stash(pid_tgid);
+            return Ok(0);
+        }
+    }
+
+    if PATH_OP_STASH.insert(&pid_tgid, &stash, 0).is_err() {
+        record_drop();
+        remove_path_stash(pid_tgid);
+    }
+    Ok(0)
+}
+
+#[inline(always)]
+fn stash_unlink(
+    pid_tgid: u64,
+    dfd: i32,
+    path_ptr: *const u8,
+    flags: u32,
+) -> Result<u32, i64> {
+    let tgid = (pid_tgid >> 32) as u32;
+    let tracked = is_tracked(tgid);
+    if !tracked && unsafe { WATCH_MODE.get(&0u32) }.copied().unwrap_or(0) == 0 {
+        return Ok(0);
+    }
+    let stash = PathOpStash {
+        old_dfd: dfd,
+        new_dfd: 0,
+        flags,
+        operation: PATH_OP_UNLINK,
+        from_watch: if tracked { 0 } else { 1 },
+    };
+    let path_len = stash_old_path(pid_tgid, path_ptr)?;
+    if path_len == 0 {
+        remove_path_stash(pid_tgid);
+        return Ok(0);
+    }
+    let path = match unsafe { PATH_OP_OLD_PATH.get(&pid_tgid) } {
+        Some(path) => path,
+        None => {
+            record_drop();
+            remove_path_stash(pid_tgid);
+            return Ok(0);
+        }
+    };
+
+    if !tracked {
+        if path_is_absolute(&path.path, path.path_len)
+            && !matches_watched_prefix(&path.path, path.path_len)
+        {
+            remove_path_stash(pid_tgid);
+            return Ok(0);
+        }
+    }
+
+    if PATH_OP_STASH.insert(&pid_tgid, &stash, 0).is_err() {
+        record_drop();
+        remove_path_stash(pid_tgid);
+    }
+    Ok(0)
+}
+
+#[inline(always)]
+fn emit_path_event(
+    kind: EventKind,
+    source: u8,
+    timestamp_ns: u64,
+    pid: u32,
+    tgid: u32,
+    dfd: i32,
+    flags: u32,
+    path: &[u8; MAX_PATH_LEN],
+    path_len: u32,
+) {
+    if let Some(mut entry) = EVENTS.reserve::<Event>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = kind as u32;
+        event.source = source;
+        event.timestamp_ns = timestamp_ns;
+
+        let payload = unsafe { &mut event.payload.file_path };
+        payload.pid = pid;
+        payload.tgid = tgid;
+        payload.dfd = dfd;
+        payload.flags = flags;
+        payload.operation_id = timestamp_ns;
+        payload.path = *path;
+        payload.path_len = path_len;
+
+        entry.submit(0);
+    } else {
+        record_drop();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +482,203 @@ fn try_openat_exit(ctx: &TracePointContext) -> Result<u32, i64> {
             record_drop();
         }
     }
+
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// Rename/unlink syscall tracepoints. Arguments are stashed on entry and only
+// emitted after a successful syscall return. Rename emits one fixed-size event
+// per path so the shared ring record remains compact.
+// ---------------------------------------------------------------------------
+#[tracepoint]
+pub fn repx_rename_enter(ctx: TracePointContext) -> u32 {
+    match try_rename_enter(&ctx) {
+        Ok(_) | Err(_) => 0,
+    }
+}
+
+fn try_rename_enter(ctx: &TracePointContext) -> Result<u32, i64> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let old_path: *const u8 = unsafe { ctx.read_at(16)? };
+    let new_path: *const u8 = unsafe { ctx.read_at(24)? };
+    stash_rename(pid_tgid, -100, old_path, -100, new_path, 0)
+}
+
+#[tracepoint]
+pub fn repx_renameat_enter(ctx: TracePointContext) -> u32 {
+    match try_renameat_enter(&ctx) {
+        Ok(_) | Err(_) => 0,
+    }
+}
+
+fn try_renameat_enter(ctx: &TracePointContext) -> Result<u32, i64> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let old_dfd: i32 = unsafe { ctx.read_at(16)? };
+    let old_path: *const u8 = unsafe { ctx.read_at(24)? };
+    let new_dfd: i32 = unsafe { ctx.read_at(32)? };
+    let new_path: *const u8 = unsafe { ctx.read_at(40)? };
+    stash_rename(pid_tgid, old_dfd, old_path, new_dfd, new_path, 0)
+}
+
+#[tracepoint]
+pub fn repx_renameat2_enter(ctx: TracePointContext) -> u32 {
+    match try_renameat2_enter(&ctx) {
+        Ok(_) | Err(_) => 0,
+    }
+}
+
+fn try_renameat2_enter(ctx: &TracePointContext) -> Result<u32, i64> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let old_dfd: i32 = unsafe { ctx.read_at(16)? };
+    let old_path: *const u8 = unsafe { ctx.read_at(24)? };
+    let new_dfd: i32 = unsafe { ctx.read_at(32)? };
+    let new_path: *const u8 = unsafe { ctx.read_at(40)? };
+    let flags: u32 = unsafe { ctx.read_at(48)? };
+    stash_rename(pid_tgid, old_dfd, old_path, new_dfd, new_path, flags)
+}
+
+#[tracepoint]
+pub fn repx_unlink_enter(ctx: TracePointContext) -> u32 {
+    match try_unlink_enter(&ctx) {
+        Ok(_) | Err(_) => 0,
+    }
+}
+
+fn try_unlink_enter(ctx: &TracePointContext) -> Result<u32, i64> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let path: *const u8 = unsafe { ctx.read_at(16)? };
+    stash_unlink(pid_tgid, -100, path, 0)
+}
+
+#[tracepoint]
+pub fn repx_unlinkat_enter(ctx: TracePointContext) -> u32 {
+    match try_unlinkat_enter(&ctx) {
+        Ok(_) | Err(_) => 0,
+    }
+}
+
+fn try_unlinkat_enter(ctx: &TracePointContext) -> Result<u32, i64> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let dfd: i32 = unsafe { ctx.read_at(16)? };
+    let path: *const u8 = unsafe { ctx.read_at(24)? };
+    let flags: u32 = unsafe { ctx.read_at(32)? };
+    stash_unlink(pid_tgid, dfd, path, flags)
+}
+
+#[tracepoint]
+pub fn repx_rename_exit(ctx: TracePointContext) -> u32 {
+    match try_path_op_exit(&ctx) {
+        Ok(_) | Err(_) => 0,
+    }
+}
+
+#[tracepoint]
+pub fn repx_renameat_exit(ctx: TracePointContext) -> u32 {
+    match try_path_op_exit(&ctx) {
+        Ok(_) | Err(_) => 0,
+    }
+}
+
+#[tracepoint]
+pub fn repx_renameat2_exit(ctx: TracePointContext) -> u32 {
+    match try_path_op_exit(&ctx) {
+        Ok(_) | Err(_) => 0,
+    }
+}
+
+#[tracepoint]
+pub fn repx_unlink_exit(ctx: TracePointContext) -> u32 {
+    match try_path_op_exit(&ctx) {
+        Ok(_) | Err(_) => 0,
+    }
+}
+
+#[tracepoint]
+pub fn repx_unlinkat_exit(ctx: TracePointContext) -> u32 {
+    match try_path_op_exit(&ctx) {
+        Ok(_) | Err(_) => 0,
+    }
+}
+
+fn try_path_op_exit(ctx: &TracePointContext) -> Result<u32, i64> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let tgid = (pid_tgid >> 32) as u32;
+    let pid = pid_tgid as u32;
+    let stash = match unsafe { PATH_OP_STASH.get(&pid_tgid) } {
+        Some(stash) => *stash,
+        None => return Ok(0),
+    };
+
+    let ret: i64 = unsafe { ctx.read_at(16)? };
+    if ret < 0 {
+        remove_path_stash(pid_tgid);
+        return Ok(0);
+    }
+
+    let timestamp_ns = unsafe { bpf_ktime_get_ns() };
+    if stash.operation == PATH_OP_RENAME {
+        let old_path = match unsafe { PATH_OP_OLD_PATH.get(&pid_tgid) } {
+            Some(path) => path,
+            None => {
+                record_drop();
+                remove_path_stash(pid_tgid);
+                return Ok(0);
+            }
+        };
+        emit_path_event(
+            EventKind::FileRenameSource,
+            stash.from_watch,
+            timestamp_ns,
+            pid,
+            tgid,
+            stash.old_dfd,
+            stash.flags,
+            &old_path.path,
+            old_path.path_len,
+        );
+        let new_path = match unsafe { PATH_OP_NEW_PATH.get(&pid_tgid) } {
+            Some(path) => path,
+            None => {
+                record_drop();
+                remove_path_stash(pid_tgid);
+                return Ok(0);
+            }
+        };
+        emit_path_event(
+            EventKind::FileRenameDestination,
+            stash.from_watch,
+            timestamp_ns,
+            pid,
+            tgid,
+            stash.new_dfd,
+            stash.flags,
+            &new_path.path,
+            new_path.path_len,
+        );
+    } else if stash.operation == PATH_OP_UNLINK {
+        let path = match unsafe { PATH_OP_OLD_PATH.get(&pid_tgid) } {
+            Some(path) => path,
+            None => {
+                record_drop();
+                remove_path_stash(pid_tgid);
+                return Ok(0);
+            }
+        };
+        emit_path_event(
+            EventKind::FileUnlink,
+            stash.from_watch,
+            timestamp_ns,
+            pid,
+            tgid,
+            stash.old_dfd,
+            stash.flags,
+            &path.path,
+            path.path_len,
+        );
+    }
+
+    remove_path_stash(pid_tgid);
 
     Ok(0)
 }

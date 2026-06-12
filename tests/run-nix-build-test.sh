@@ -115,8 +115,10 @@ gcc -c -I"$SRC" -o "$OUT/main.o" "$SRC/main.c"
 # Step 2: Link the object files into the final binary.
 gcc -o "$OUT/calculator" "$OUT/math.o" "$OUT/main.o"
 
-# Step 3: Run the binary and capture output as a build artifact.
-"$OUT/calculator" > "$OUT/output.txt"
+# Step 3: Publish output atomically through a temporary file. This exercises
+# close-before-rename attribution to the final workspace path.
+"$OUT/calculator" > "$OUT/output.txt.tmp"
+mv -f "$OUT/output.txt.tmp" "$OUT/output.txt"
 
 echo "Build complete. Output:"
 cat "$OUT/output.txt"
@@ -132,6 +134,15 @@ echo "=== Trace: building project under repx ==="
 "$REPX" trace --output-root "$TMPDIR/build" \
     --dump-ops "$TMPDIR/trace-ops.json" -o "$TMPDIR/attestation.json" -- \
     "$TMPDIR/build.sh" "$TMPDIR/src" "$TMPDIR/build"
+
+python3 - "$TMPDIR/trace-ops.json" <<'PYEOF'
+import json
+import sys
+
+ops = json.load(open(sys.argv[1]))
+if not any(op["op_type"] == "FileRename" for op in ops):
+    raise SystemExit("expected temp-file publication to produce a FileRename operation")
+PYEOF
 
 echo ""
 echo "=== Build output ==="
