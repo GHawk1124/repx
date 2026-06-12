@@ -8,7 +8,6 @@
 \usepackage{amsmath, amssymb}
 \usepackage{booktabs}
 \usepackage{hyperref}
-\usepackage{enumitem}
 
 \title{repx: Kernel-Level Process Attestation for Reproducible Build Provenance}
 \author{Anonymous}
@@ -36,24 +35,24 @@ Let a build run produce a time-ordered stream of observed runtime events
 \[
 E = (e_1, e_2, \dots, e_n),
 \]
-where each event is emitted from kernel tracepoints. The goal is to compute a canonical operation sequence
+where each event is emitted from kernel tracepoints. The implementation maps this stream to a canonical set of distinct operations
 \[
-C = \mathcal{N}(E),
+C = \operatorname{set}(\mathcal{N}(E)),
 \]
-where $\mathcal{N}$ normalizes system-dependent details (for example, process IDs and some system-state reads), and then compute a commitment
+where $\mathcal{N}$ normalizes system-dependent details and operation hashes are sorted and deduplicated. Counts, ordering, timestamps, and logical process indices are not part of the semantic commitment. The system then computes
 \[
-R = \mathcal{M}(C),
+R_p = \mathcal{M}(C),
 \]
-where $\mathcal{M}$ is a Merkle-tree root over operation hashes.
+where $\mathcal{M}$ is a Merkle-tree root over the sorted operation hashes. A top-level root additionally binds $R_p$ to the exact command, output-selection policy, and selected output hashes.
 
-Two runs are considered behaviorally equivalent under this model if and only if they produce the same root $R$ after canonicalization. A mismatch indicates behavioral divergence and can be localized by descending divergent Merkle nodes.
+Two runs are equivalent under this model if and only if they produce the same top-level root. Because $C$ is a set rather than a sequence, diagnostics use set difference over leaf hashes; positional Merkle descent would produce cascading differences after an insertion.
 
 \section{System Overview}
 \texttt{repx} consists of three components:
-\begin{enumerate}[leftmargin=*]
+\begin{enumerate}
   \item \textbf{eBPF collection layer} (kernel-space): captures selected tracepoints for open/close, mmap, exec, fork, and exit, scoped to a root process and descendants.
-  \item \textbf{Userspace tracer and canonicalizer}: resolves paths, associates file descriptors, computes content hashes, normalizes selected system-state accesses, and maps real PIDs to logical process indices.
-  \item \textbf{Attestation layer}: hashes canonical operations and builds a Merkle tree; emits a JSON attestation containing root hash, tree, and command metadata.
+  \item \textbf{Userspace tracer and canonicalizer}: resolves successful opens through \texttt{/proc/<pid>/fd}, validates resolved targets against captured paths, retains nonblocking regular-file handles when possible, filters external watch events before observation, hashes file identity as events arrive, normalizes selected system-state accesses, and maps real PIDs to diagnostic logical indices.
+  \item \textbf{Attestation layer}: hashes canonical operations and builds a Merkle tree; emits a JSON attestation containing the sorted leaves plus a root that binds the command and output policy.
 \end{enumerate}
 
 Verification re-runs the command, recomputes the root, and reports either equality (verified) or divergence points (diagnostics).
@@ -64,25 +63,27 @@ Verification re-runs the command, recomputes the root, and reports either equali
 
 \subsection{A Canonicalization Strategy for Reproducibility}
 The prototype contributes a concrete normalization pipeline:
-\begin{itemize}[leftmargin=*]
-  \item content hashing of file inputs/outputs rather than path-only identity,
+\begin{itemize}
+  \item event-arrival hashing of file inputs/outputs rather than end-of-run path hashing,
+  \item unavailable identities that distinguish missing, unreadable, and non-regular files, bind stable paths, and normalize recognized session/compiler temporary names,
+  \item output-rooted slicing that commits selected output hashes and content-resolved dependencies while omitting unavailable transient intermediates from the dependency walk,
   \item normalization of selected host-state reads (for example, \texttt{/proc}, \texttt{/sys}) via sentinel values,
   \item logical process indexing and root-process anchoring to reduce run-specific variance.
 \end{itemize}
 This is valuable as a reusable pattern for future provenance systems.
 
 \subsection{Commit-and-Diff Verifiability}
-The Merkle commitment provides two academic benefits:
-\begin{itemize}[leftmargin=*]
+The sorted-set Merkle commitment provides two academic benefits:
+\begin{itemize}
   \item \textbf{compact verification}: one root hash for equality checks,
-  \item \textbf{explainable failure}: subtree descent to isolate where runs diverged.
+  \item \textbf{explainable failure}: added and missing operation hashes without positional cascades.
 \end{itemize}
 This combines cryptographic succinctness with operational diagnosability.
 
 \subsection{Integrity-Aware Handling of Telemetry Loss}
-The implementation tracks dropped ring-buffer events and distinguishes policy by mode:
-\begin{itemize}[leftmargin=*]
-  \item trace mode warns and still emits output,
+The implementation tracks dropped ring-buffer events and fails closed by default:
+\begin{itemize}
+  \item trace mode refuses to emit an attestation unless the user explicitly supplies \texttt{--allow-dropped-events},
   \item verify mode fails closed on dropped events.
 \end{itemize}
 This explicit treatment of observability failure is a meaningful research property; many tracing systems silently degrade.
@@ -91,34 +92,58 @@ This explicit treatment of observability failure is a meaningful research proper
 \textbf{In-scope:} behavioral changes that alter traced process activity (extra writes, modified tool binaries, changed command paths, altered build scripts, new process chains, etc.).
 
 \textbf{Out-of-scope / partial:}
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
   \item attacks entirely outside traced event coverage,
   \item kernel compromise (the monitor and measured environment are not independent),
   \item races where \texttt{/proc}-based best-effort enrichments are unavailable,
-  \item semantics not yet encoded in canonicalization (for example, complete filesystem namespace resolution).
+  \item semantics not yet encoded in canonicalization (for example, complete filesystem namespace resolution),
+  \item replacement of the attestation file itself: the JSON document is not yet signed or wrapped in DSSE.
 \end{itemize}
 
 Therefore, the attestation is best interpreted as a \emph{deterministic commitment over observed covered behavior}, not a full proof of non-malicious execution.
 
+\subsection{Explicit Evasion and Coverage Table}
+The prototype's collection boundary is security-relevant. An adversary controlling the build can deliberately select an uncovered mechanism.
+
+\begin{center}
+\begin{tabular}{p{0.28\linewidth}p{0.62\linewidth}}
+\toprule
+Mechanism & Current status \\
+\midrule
+\texttt{openat}, \texttt{close}, file-backed \texttt{mmap} & Covered; \texttt{O\_RDWR} is modeled as both read and write. Writable private mappings are reads, while only writable \texttt{MAP\_SHARED} mappings are writes. \\
+\texttt{open}, \texttt{openat2} & Not traced. \\
+\texttt{rename}, \texttt{unlink} & Not modeled as operations; temp-file replacement can escape write attribution. \\
+\texttt{dup*}, inherited descriptors & Descriptor attribution is incomplete. \\
+\texttt{sendfile}, \texttt{copy\_file\_range}, \texttt{io\_uring} & Not traced. \\
+Network I/O & Not traced; remote scripts or data are outside the commitment unless they also appear through a covered file access. \\
+Watch-mode relative reads & May be missed because the eBPF prefix check sees the raw relative pathname before userspace resolution. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+This table is part of the security claim, not merely an implementation backlog.
+
 \section{Prototype Evidence}
 The repository includes integration scenarios demonstrating:
-\begin{enumerate}[leftmargin=*]
+\begin{enumerate}
   \item successful trace/verify consistency on deterministic C build workflows,
   \item detection of process-level divergence in a script-tampering ``attack demo'' where hidden output is introduced.
 \end{enumerate}
 These are prototype-level case studies, not a statistically powered benchmark. Their research value is proof-of-feasibility for the process-attestation model.
 
 \section{Limitations (Important for Correct Interpretation)}
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
   \item \textbf{Platform scope:} Linux + eBPF, requiring elevated privileges/capabilities.
   \item \textbf{Coverage scope:} only selected syscalls/tracepoints are modeled.
+  \item \textbf{Set semantics:} repeated operations and temporal order are intentionally discarded for reproducibility.
+  \item \textbf{Unsigned envelope:} the root binds command and policy fields, but authenticity still depends on trusted distribution of either the JSON file or an out-of-band root supplied with \texttt{--expected-root}.
   \item \textbf{Canonicalization assumptions:} some path and process metadata enrichment is best-effort.
   \item \textbf{No formal proof yet:} the current guarantees are empirical and implementation-driven.
   \item \textbf{No large-scale evaluation yet:} overhead and false-positive/negative behavior across diverse ecosystems remain open.
 \end{itemize}
 
 \section{Research Opportunities Enabled by repx}
-\begin{enumerate}[leftmargin=*]
+\begin{enumerate}
   \item \textbf{Formal semantics of canonicalization:} prove invariants and equivalence classes for reproducible runs.
   \item \textbf{Coverage optimization:} identify minimal tracepoint sets that maximize attack detectability.
   \item \textbf{Cross-host reproducibility studies:} quantify which host differences must be normalized.
@@ -127,7 +152,7 @@ These are prototype-level case studies, not a statistically powered benchmark. T
 \end{enumerate}
 
 \section{Conclusion}
-\texttt{repx} demonstrates a practical and academically relevant pattern: kernel-level execution traces can be transformed into deterministic, cryptographically verifiable process provenance. The strongest contribution is conceptual and methodological: a concrete pathway from runtime telemetry to reproducible attestations with divergence diagnostics. While the prototype has clear limitations, it provides a strong foundation for research on process-centric supply-chain integrity and reproducible build assurance.
+\texttt{repx} demonstrates a practical and academically relevant pattern: selected kernel-level execution observations can be transformed into deterministic, hash-committed process provenance. The strongest contribution is conceptual and methodological: a concrete pathway from runtime telemetry to reproducible attestations with set-based divergence diagnostics. The prototype does not prove that all build behavior was observed and does not yet authenticate its JSON envelope, but it provides a defensible foundation for research on process-centric supply-chain integrity and reproducible build assurance.
 
 \begin{thebibliography}{9}
 

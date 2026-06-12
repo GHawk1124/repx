@@ -11,26 +11,9 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::fs;
 
+use crate::file_identity::{is_path_within, is_system_state, SYSTEM_STATE_SENTINEL};
 use crate::tracer::TracedEvent;
-
-/// Sentinel hash used for system state reads that should be normalized.
-pub const SYSTEM_STATE_SENTINEL: &str =
-    "SYSTEM_STATE:0000000000000000000000000000000000000000000000000000000000000000";
-
-/// Paths that represent system state rather than build inputs.
-const SYSTEM_STATE_PREFIXES: &[&str] = &[
-    "/proc/",
-    "/sys/",
-    "/etc/hostname",
-    "/etc/os-release",
-    "/etc/machine-id",
-    "/dev/urandom",
-    "/dev/random",
-    "/dev/null",
-    "/dev/zero",
-];
 
 /// A canonicalized build operation, independent of any specific system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,12 +51,8 @@ pub enum OpType {
 }
 
 impl CanonicalOp {
-    /// Produce a deterministic hash of this operation for the merkle tree.
-    pub fn hash(&self) -> String {
-        let mut hasher = Sha256::new();
-        // Use a stable string representation instead of Debug format,
-        // which could change between compiler versions.
-        let op_tag = match self.op_type {
+    fn op_tag(&self) -> &'static str {
+        match self.op_type {
             OpType::Exec => "exec",
             OpType::FileRead => "file_read",
             OpType::FileWrite => "file_write",
@@ -81,10 +60,17 @@ impl CanonicalOp {
             OpType::Exit => "exit",
             OpType::ExternalFileRead => "external_file_read",
             OpType::ExternalFileWrite => "external_file_write",
-        };
-        hasher.update(op_tag.as_bytes());
-        hasher.update(self.process_index.to_le_bytes());
+        }
+    }
 
+    /// Produce a deterministic hash of this operation for the merkle tree.
+    pub fn hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.op_tag().as_bytes());
+
+        // Logical process indices depend on scheduler/event arrival order in
+        // concurrent build tools. Keep them in dump-ops for diagnostics, but
+        // exclude them from the semantic attestation hash.
         if let Some(ref th) = self.tool_hash {
             hasher.update(th.as_bytes());
         }
@@ -106,33 +92,25 @@ impl CanonicalOp {
     }
 }
 
-/// Check if a path represents system state that should be normalized.
-fn is_system_state(path: &str) -> bool {
-    SYSTEM_STATE_PREFIXES
-        .iter()
-        .any(|prefix| path.starts_with(prefix))
-}
-
-/// Hash the contents of a regular file. Returns None if the path is unreadable
-/// or is not a regular file (FIFOs, sockets, and devices would block on read).
-fn hash_file_contents(path: &str) -> Option<String> {
-    let meta = fs::metadata(path).ok()?;
-    if !meta.is_file() {
-        return None;
+pub(crate) fn finalize_ops(mut ops: Vec<CanonicalOp>) -> Vec<CanonicalOp> {
+    // Canonical roots are file/content-centric. Low-level open/read/mmap
+    // counts and independent process interleavings can vary across otherwise
+    // identical runs, especially under JVM-based build systems like Bazel.
+    for op in &mut ops {
+        op.args.sort();
+        op.input_hashes.sort();
+        op.output_hashes.sort();
     }
-    let data = fs::read(path).ok()?;
-    let hash = Sha256::digest(&data);
-    Some(format!("sha256:{:x}", hash))
-}
 
-/// Hash a byte slice.
-fn hash_bytes(data: &[u8]) -> String {
-    let hash = Sha256::digest(data);
-    format!("sha256:{:x}", hash)
+    ops.sort_by_key(|op| op.hash());
+    ops.dedup_by(|a, b| a.hash() == b.hash());
+    ops
 }
 
 fn is_watched_path(path: &str, watch_prefixes: &[String]) -> bool {
-    watch_prefixes.iter().any(|prefix| path.starts_with(prefix))
+    watch_prefixes
+        .iter()
+        .any(|prefix| is_path_within(path, prefix))
 }
 
 /// Canonicalize raw traced events into system-independent operations.
@@ -171,9 +149,7 @@ pub fn canonicalize_events(
     for event in &events {
         match event {
             TracedEvent::Exec {
-                pid,
-                filename,
-                ..
+                pid, observation, ..
             } => {
                 // Assign logical index if new.
                 if !pid_to_index.contains_key(pid) {
@@ -182,11 +158,8 @@ pub fn canonicalize_events(
                 }
                 let proc_idx = pid_to_index[pid];
 
-                // Hash the executable binary.
-                let tool_hash = hash_file_contents(filename);
-                if let Some(ref th) = tool_hash {
-                    pid_to_tool_hash.insert(*pid, th.clone());
-                }
+                let tool_hash = observation.identity();
+                pid_to_tool_hash.insert(*pid, tool_hash.clone());
 
                 // Argv is intentionally empty: BPF kernel-stack captures are
                 // racy (the same exec yields different argv across runs) and
@@ -196,7 +169,7 @@ pub fn canonicalize_events(
                 ops.push(CanonicalOp {
                     op_type: OpType::Exec,
                     process_index: proc_idx,
-                    tool_hash,
+                    tool_hash: Some(tool_hash),
                     args: vec![],
                     input_hashes: vec![],
                     output_hashes: vec![],
@@ -209,14 +182,17 @@ pub fn canonicalize_events(
                 flags,
                 fd,
                 external,
+                observation,
                 ..
             } => {
                 if *external && !is_watched_path(path, watch_prefixes) {
                     continue;
                 }
 
-                // O_WRONLY = 1, O_RDWR = 2 on Linux
-                let is_write = (flags & 0x3) != 0;
+                // Linux O_ACCMODE: O_RDONLY=0, O_WRONLY=1, O_RDWR=2.
+                let access_mode = flags & 0x3;
+                let can_read = access_mode != 1;
+                let can_write = access_mode != 0;
 
                 let fallback_external = !*external
                     && *pid != root_pid
@@ -227,7 +203,17 @@ pub fn canonicalize_events(
                 if *external || fallback_external {
                     fallback_external_pids.insert(*pid);
                     // External process touching a watched path.
-                    if is_write {
+                    if can_read {
+                        external_ops.push(CanonicalOp {
+                            op_type: OpType::ExternalFileRead,
+                            process_index: u32::MAX,
+                            tool_hash: None,
+                            args: vec![],
+                            input_hashes: vec![observation.identity()],
+                            output_hashes: vec![],
+                        });
+                    }
+                    if can_write {
                         let op_idx = external_ops.len();
                         external_ops.push(CanonicalOp {
                             op_type: OpType::ExternalFileWrite,
@@ -238,17 +224,6 @@ pub fn canonicalize_events(
                             output_hashes: vec![],
                         });
                         external_pending_writes.insert((*pid, *fd), op_idx);
-                    } else {
-                        let input_hash =
-                            hash_file_contents(path).unwrap_or_else(|| hash_bytes(b"<unreadable>"));
-                        external_ops.push(CanonicalOp {
-                            op_type: OpType::ExternalFileRead,
-                            process_index: u32::MAX,
-                            tool_hash: None,
-                            args: vec![],
-                            input_hashes: vec![input_hash],
-                            output_hashes: vec![],
-                        });
                     }
                     continue;
                 }
@@ -268,30 +243,31 @@ pub fn canonicalize_events(
                         input_hashes: vec![SYSTEM_STATE_SENTINEL.to_string()],
                         output_hashes: vec![],
                     });
-                } else if is_write {
-                    // Output file: we'll hash on close.
-                    let op_idx = ops.len();
-                    ops.push(CanonicalOp {
-                        op_type: OpType::FileWrite,
-                        process_index: proc_idx,
-                        tool_hash: pid_to_tool_hash.get(pid).cloned(),
-                        args: vec![],
-                        input_hashes: vec![],
-                        output_hashes: vec![], // filled when we see the close
-                    });
-                    pending_writes.insert((*pid, *fd), op_idx);
                 } else {
-                    // Input file: hash contents now.
-                    let input_hash =
-                        hash_file_contents(path).unwrap_or_else(|| hash_bytes(b"<unreadable>"));
-                    ops.push(CanonicalOp {
-                        op_type: OpType::FileRead,
-                        process_index: proc_idx,
-                        tool_hash: pid_to_tool_hash.get(pid).cloned(),
-                        args: vec![],
-                        input_hashes: vec![input_hash],
-                        output_hashes: vec![],
-                    });
+                    if can_read {
+                        ops.push(CanonicalOp {
+                            op_type: OpType::FileRead,
+                            process_index: proc_idx,
+                            tool_hash: pid_to_tool_hash.get(pid).cloned(),
+                            args: vec![],
+                            input_hashes: vec![observation.identity()],
+                            output_hashes: vec![],
+                        });
+                    }
+
+                    if can_write {
+                        // Output file: its close event carries the final identity.
+                        let op_idx = ops.len();
+                        ops.push(CanonicalOp {
+                            op_type: OpType::FileWrite,
+                            process_index: proc_idx,
+                            tool_hash: pid_to_tool_hash.get(pid).cloned(),
+                            args: vec![],
+                            input_hashes: vec![],
+                            output_hashes: vec![], // filled when we see the close
+                        });
+                        pending_writes.insert((*pid, *fd), op_idx);
+                    }
                 }
             }
 
@@ -299,8 +275,10 @@ pub fn canonicalize_events(
                 pid,
                 fd,
                 prot,
+                flags,
                 path,
                 external,
+                observation,
                 ..
             } => {
                 if *external {
@@ -312,9 +290,10 @@ pub fn canonicalize_events(
                     }
                 }
 
-                if let Some(path) = path {
-                    // PROT_WRITE = 0x2
-                    let is_write = (prot & 0x2) != 0;
+                if let (Some(path), Some(observation)) = (path, observation) {
+                    // A private writable mapping does not write back to the file.
+                    // MAP_SHARED and MAP_SHARED_VALIDATE both have bit 0 set.
+                    let is_write = (prot & 0x2) != 0 && (flags & 0x1) != 0;
 
                     let fallback_external = !*external
                         && (*pid != root_pid)
@@ -324,28 +303,29 @@ pub fn canonicalize_events(
 
                     if *external || fallback_external {
                         fallback_external_pids.insert(*pid);
+                        external_ops.push(CanonicalOp {
+                            op_type: OpType::ExternalFileRead,
+                            process_index: u32::MAX,
+                            tool_hash: None,
+                            args: vec!["mmap".to_string()],
+                            input_hashes: vec![observation.identity()],
+                            output_hashes: vec![],
+                        });
                         if is_write {
-                            let op_idx = external_ops.len();
-                            external_ops.push(CanonicalOp {
-                                op_type: OpType::ExternalFileWrite,
-                                process_index: u32::MAX,
-                                tool_hash: None,
-                                args: vec![],
-                                input_hashes: vec![],
-                                output_hashes: vec![],
-                            });
-                            external_pending_writes.insert((*pid, *fd), op_idx);
-                        } else {
-                            let input_hash = hash_file_contents(path)
-                                .unwrap_or_else(|| hash_bytes(b"<unreadable>"));
-                            external_ops.push(CanonicalOp {
-                                op_type: OpType::ExternalFileRead,
-                                process_index: u32::MAX,
-                                tool_hash: None,
-                                args: vec![],
-                                input_hashes: vec![input_hash],
-                                output_hashes: vec![],
-                            });
+                            external_pending_writes
+                                .entry((*pid, *fd))
+                                .or_insert_with(|| {
+                                    let op_idx = external_ops.len();
+                                    external_ops.push(CanonicalOp {
+                                        op_type: OpType::ExternalFileWrite,
+                                        process_index: u32::MAX,
+                                        tool_hash: None,
+                                        args: vec![],
+                                        input_hashes: vec![],
+                                        output_hashes: vec![],
+                                    });
+                                    op_idx
+                                });
                         }
                         continue;
                     }
@@ -365,28 +345,30 @@ pub fn canonicalize_events(
                             input_hashes: vec![SYSTEM_STATE_SENTINEL.to_string()],
                             output_hashes: vec![],
                         });
-                    } else if is_write {
-                        let op_idx = ops.len();
-                        ops.push(CanonicalOp {
-                            op_type: OpType::FileWrite,
-                            process_index: proc_idx,
-                            tool_hash: pid_to_tool_hash.get(pid).cloned(),
-                            args: vec![],
-                            input_hashes: vec![],
-                            output_hashes: vec![],
-                        });
-                        pending_writes.insert((*pid, *fd), op_idx);
                     } else {
-                        let input_hash =
-                            hash_file_contents(path).unwrap_or_else(|| hash_bytes(b"<unreadable>"));
                         ops.push(CanonicalOp {
                             op_type: OpType::FileRead,
                             process_index: proc_idx,
                             tool_hash: pid_to_tool_hash.get(pid).cloned(),
-                            args: vec![],
-                            input_hashes: vec![input_hash],
+                            args: vec!["mmap".to_string()],
+                            input_hashes: vec![observation.identity()],
                             output_hashes: vec![],
                         });
+
+                        if is_write {
+                            pending_writes.entry((*pid, *fd)).or_insert_with(|| {
+                                let op_idx = ops.len();
+                                ops.push(CanonicalOp {
+                                    op_type: OpType::FileWrite,
+                                    process_index: proc_idx,
+                                    tool_hash: pid_to_tool_hash.get(pid).cloned(),
+                                    args: vec![],
+                                    input_hashes: vec![],
+                                    output_hashes: vec![],
+                                });
+                                op_idx
+                            });
+                        }
                     }
                 }
             }
@@ -396,6 +378,7 @@ pub fn canonicalize_events(
                 fd,
                 path,
                 external,
+                observation,
                 ..
             } => {
                 if let Some(path) = path {
@@ -407,18 +390,16 @@ pub fn canonicalize_events(
                     if *external || fallback_external {
                         // Resolve pending external write if any.
                         if let Some(op_idx) = external_pending_writes.remove(&(*pid, *fd)) {
-                            let output_hash = hash_file_contents(path)
-                                .unwrap_or_else(|| hash_bytes(b"<unreadable>"));
-                            if let Some(op) = external_ops.get_mut(op_idx) {
-                                op.output_hashes.push(output_hash);
+                            if let (Some(op), Some(observation)) =
+                                (external_ops.get_mut(op_idx), observation)
+                            {
+                                op.output_hashes.push(observation.identity());
                             }
                         }
                     } else if let Some(op_idx) = pending_writes.remove(&(*pid, *fd)) {
                         // Fork-tree pending write.
-                        let output_hash =
-                            hash_file_contents(path).unwrap_or_else(|| hash_bytes(b"<unreadable>"));
-                        if let Some(op) = ops.get_mut(op_idx) {
-                            op.output_hashes.push(output_hash);
+                        if let (Some(op), Some(observation)) = (ops.get_mut(op_idx), observation) {
+                            op.output_hashes.push(observation.identity());
                         }
                     }
                 }
@@ -448,18 +429,15 @@ pub fn canonicalize_events(
         }
     }
 
-    // Sort external ops by their content hash for deterministic ordering.
-    // External events arrive in non-deterministic order (any process, any time),
-    // so we sort to produce a stable attestation across runs.
-    external_ops.sort_by(|a, b| a.hash().cmp(&b.hash()));
     ops.extend(external_ops);
 
-    Ok(ops)
+    Ok(finalize_ops(ops))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_identity::observe_path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_test_dir(name: &str) -> std::path::PathBuf {
@@ -481,8 +459,8 @@ mod tests {
                 path: "/tmp/not-watched".to_string(),
                 flags: 1,
                 fd: 3,
-                dfd: 0,
                 external: true,
+                observation: observe_path("/tmp/not-watched"),
             }],
             1,
             &["/watched".to_string()],
@@ -499,8 +477,10 @@ mod tests {
                 pid: 2,
                 fd: 3,
                 prot: 0,
+                flags: 0x2,
                 path: Some("/tmp/not-watched".to_string()),
                 external: true,
+                observation: Some(observe_path("/tmp/not-watched")),
             }],
             1,
             &["/watched".to_string()],
@@ -527,27 +507,28 @@ mod tests {
                     path: write_path.to_string_lossy().to_string(),
                     flags: 1,
                     fd: 3,
-                    dfd: 0,
                     external: false,
+                    observation: observe_path(&write_path.to_string_lossy()),
                 },
                 TracedEvent::Exec {
                     pid: 2,
-                    ppid: 1,
-                    filename: "/bin/true".to_string(),
-                    argv: vec!["/bin/true".to_string()],
+                    observation: observe_path("/bin/true"),
                 },
                 TracedEvent::FileMmap {
                     pid: 2,
                     fd: 4,
                     prot: 0,
+                    flags: 0x2,
                     path: Some(mmap_path.to_string_lossy().to_string()),
                     external: false,
+                    observation: Some(observe_path(&mmap_path.to_string_lossy())),
                 },
                 TracedEvent::FileClose {
                     pid: 2,
                     fd: 3,
                     path: Some(write_path.to_string_lossy().to_string()),
                     external: false,
+                    observation: Some(observe_path(&write_path.to_string_lossy())),
                 },
             ],
             1,
@@ -574,6 +555,69 @@ mod tests {
             0
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_write_open_records_both_input_and_output() {
+        let dir = unique_test_dir("rdwr");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("archive.a");
+        std::fs::write(&path, b"archive").unwrap();
+        let observation = observe_path(&path.to_string_lossy());
+
+        let ops = canonicalize_events(
+            vec![
+                TracedEvent::FileOpen {
+                    pid: 1,
+                    path: path.to_string_lossy().into_owned(),
+                    flags: 2,
+                    fd: 3,
+                    external: false,
+                    observation: observation.clone(),
+                },
+                TracedEvent::FileClose {
+                    pid: 1,
+                    fd: 3,
+                    path: Some(path.to_string_lossy().into_owned()),
+                    external: false,
+                    observation: Some(observation),
+                },
+            ],
+            1,
+            &[],
+        )
+        .unwrap();
+
+        assert!(ops.iter().any(|op| op.op_type == OpType::FileRead));
+        assert!(ops.iter().any(|op| op.op_type == OpType::FileWrite));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn private_writable_mmap_is_a_read_not_a_write() {
+        let dir = unique_test_dir("private-mmap");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.so");
+        std::fs::write(&path, b"library").unwrap();
+
+        let ops = canonicalize_events(
+            vec![TracedEvent::FileMmap {
+                pid: 1,
+                fd: 3,
+                prot: 0x3,
+                flags: 0x2,
+                path: Some(path.to_string_lossy().into_owned()),
+                external: false,
+                observation: Some(observe_path(&path.to_string_lossy())),
+            }],
+            1,
+            &[],
+        )
+        .unwrap();
+
+        assert!(ops.iter().any(|op| op.op_type == OpType::FileRead));
+        assert!(!ops.iter().any(|op| op.op_type == OpType::FileWrite));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

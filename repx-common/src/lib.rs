@@ -15,15 +15,6 @@ pub const MAX_WATCH_PREFIXES: usize = 8;
 /// Maximum length of a watched path prefix.
 pub const MAX_PREFIX_LEN: usize = 128;
 
-/// Maximum argument length for execve events.
-pub const MAX_ARG_LEN: usize = 128;
-
-/// Maximum number of argv entries we capture.
-pub const MAX_ARGS: usize = 20;
-
-/// Maximum number of environment variables we capture.
-pub const MAX_ENV_ENTRIES: usize = 16;
-
 /// Discriminant for event types sent over the ring buffer.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,12 +23,27 @@ pub enum EventKind {
     FileOpen = 1,
     /// A file descriptor was closed (triggers output hashing in userspace).
     FileClose = 2,
-    /// A process was exec'd (captures binary path + argv).
+    /// A process was exec'd (captures the binary path).
     ProcessExec = 3,
     /// Process exited.
     ProcessExit = 4,
     /// A file was memory-mapped (captures fd + prot + flags).
     FileMmap = 5,
+}
+
+impl TryFrom<u32> for EventKind {
+    type Error = ();
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::FileOpen),
+            2 => Ok(Self::FileClose),
+            3 => Ok(Self::ProcessExec),
+            4 => Ok(Self::ProcessExit),
+            5 => Ok(Self::FileMmap),
+            _ => Err(()),
+        }
+    }
 }
 
 /// Event emitted when a file is opened via openat/open.
@@ -78,20 +84,12 @@ pub struct FileCloseEvent {
 pub struct ProcessExecEvent {
     /// PID of the new process.
     pub pid: u32,
-    /// Parent PID.
-    pub ppid: u32,
     /// Thread group ID.
     pub tgid: u32,
     /// Path of the executable.
     pub filename: [u8; MAX_PATH_LEN],
     /// Actual length of filename.
     pub filename_len: u32,
-    /// Number of arguments captured.
-    pub argc: u32,
-    /// Flattened argument buffer (null-separated).
-    pub argv_buf: [u8; MAX_ARG_LEN * MAX_ARGS],
-    /// Total bytes used in argv_buf.
-    pub argv_total_len: u32,
 }
 
 /// Event emitted when a process exits.
@@ -138,7 +136,7 @@ unsafe impl aya::Pod for WatchedPrefix {}
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Event {
-    pub kind: EventKind,       // 4 bytes at offset 0
+    pub kind: u32,             // EventKind discriminant at offset 0
     pub source: u8,            // 1 byte at offset 4 (0=fork-tree, 1=watched-path)
     pub _pad: [u8; 3],         // 3 bytes of padding at offset 5
     pub timestamp_ns: u64,     // 8 bytes at offset 8
@@ -155,5 +153,21 @@ pub union EventPayload {
     pub file_mmap: FileMmapEvent,
     pub process_exec: ProcessExecEvent,
     pub process_exit: ProcessExitEvent,
-    pub _pad: [u8; core::mem::size_of::<ProcessExecEvent>()],
+    pub _pad: [u8; core::mem::size_of::<FileOpenEvent>()],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_size_stays_small_enough_for_bursty_builds() {
+        assert!(core::mem::size_of::<Event>() <= 320);
+    }
+
+    #[test]
+    fn unknown_event_kinds_are_rejected() {
+        assert_eq!(EventKind::try_from(3), Ok(EventKind::ProcessExec));
+        assert!(EventKind::try_from(u32::MAX).is_err());
+    }
 }

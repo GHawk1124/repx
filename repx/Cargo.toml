@@ -3,6 +3,7 @@ name = "repx"
 version = "0.1.0"
 edition = "2021"
 description = "Reproducible process attestations for supply chain security"
+license = "MIT"
 
 [dependencies]
 repx-common = { path = "../repx-common", features = ["user"] }

@@ -13,9 +13,11 @@ use aya_ebpf::{
 };
 use repx_common::*;
 
-/// Ring buffer for sending events to userspace.
+/// Ring buffer for sending events to userspace. Bazel can emit tens of
+/// thousands of file events in short bursts, so leave enough headroom for
+/// userspace hashing without weakening fail-closed drop handling.
 #[map]
-static EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
+static EVENTS: RingBuf = RingBuf::with_byte_size(32 * 1024 * 1024, 0);
 
 /// Set of PIDs we're tracking (the traced process and its children).
 /// Key: tgid, Value: 1 if tracked.
@@ -71,7 +73,9 @@ fn is_tracked(tgid: u32) -> bool {
 
 #[inline(always)]
 fn track_pid(tgid: u32) {
-    let _ = TRACKED_PIDS.insert(&tgid, &1u8, 0);
+    if TRACKED_PIDS.insert(&tgid, &1u8, 0).is_err() {
+        record_drop();
+    }
 }
 
 #[inline(always)]
@@ -173,14 +177,20 @@ fn try_openat_enter(ctx: &TracePointContext) -> Result<u32, i64> {
             return Ok(0);
         }
 
-        // O_WRONLY = 1, O_RDWR = 2 on Linux.
+        // O_WRONLY = 1, O_RDWR = 2 on Linux. Absolute paths can be
+        // filtered here; relative writes need userspace resolution first.
         let is_write = (flags & 0x3) != 0;
-        if !is_write && !matches_watched_prefix(&stash.path, stash.path_len) {
+        let is_absolute = stash.path.first().copied() == Some(b'/');
+        if (!is_write || is_absolute)
+            && !matches_watched_prefix(&stash.path, stash.path_len)
+        {
             return Ok(0);
         }
     }
 
-    let _ = OPENAT_STASH.insert(&pid_tgid, &stash, 0);
+    if OPENAT_STASH.insert(&pid_tgid, &stash, 0).is_err() {
+        record_drop();
+    }
     Ok(0)
 }
 
@@ -218,7 +228,7 @@ fn try_openat_exit(ctx: &TracePointContext) -> Result<u32, i64> {
 
     if let Some(mut entry) = EVENTS.reserve::<Event>(0) {
         let event = unsafe { &mut *entry.as_mut_ptr() };
-        event.kind = EventKind::FileOpen;
+        event.kind = EventKind::FileOpen as u32;
         event.source = stash.from_watch;
         event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
 
@@ -239,7 +249,9 @@ fn try_openat_exit(ctx: &TracePointContext) -> Result<u32, i64> {
     // For watch-mode opens, register the fd so we can track close/mmap.
     if stash.from_watch == 1 {
         let fd_key: u64 = ((tgid as u64) << 32) | (fd as u32 as u64);
-        let _ = WATCHED_FDS.insert(&fd_key, &1u8, 0);
+        if WATCHED_FDS.insert(&fd_key, &1u8, 0).is_err() {
+            record_drop();
+        }
     }
 
     Ok(0)
@@ -279,7 +291,7 @@ fn try_close_enter(ctx: &TracePointContext) -> Result<u32, i64> {
 
     if let Some(mut entry) = EVENTS.reserve::<Event>(0) {
         let event = unsafe { &mut *entry.as_mut_ptr() };
-        event.kind = EventKind::FileClose;
+        event.kind = EventKind::FileClose as u32;
         event.source = source;
         event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
 
@@ -345,7 +357,7 @@ fn try_mmap_enter(ctx: &TracePointContext) -> Result<u32, i64> {
 
     if let Some(mut entry) = EVENTS.reserve::<Event>(0) {
         let event = unsafe { &mut *entry.as_mut_ptr() };
-        event.kind = EventKind::FileMmap;
+        event.kind = EventKind::FileMmap as u32;
         event.source = source;
         event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
 
@@ -401,19 +413,15 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
     let filename_offset = (data_loc & 0xFFFF) as usize;
     if let Some(mut entry) = EVENTS.reserve::<Event>(0) {
         let event = unsafe { &mut *entry.as_mut_ptr() };
-        event.kind = EventKind::ProcessExec;
+        event.kind = EventKind::ProcessExec as u32;
         event.source = 0;
         event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
 
         let payload = unsafe { &mut event.payload.process_exec };
         payload.pid = pid;
-        payload.ppid = 0;
         payload.tgid = tgid;
         payload.filename = [0u8; MAX_PATH_LEN];
         payload.filename_len = 0;
-        payload.argc = 0;
-        payload.argv_buf = [0u8; MAX_ARG_LEN * MAX_ARGS];
-        payload.argv_total_len = 0;
 
         let ctx_ptr = ctx.as_ptr() as *const u8;
         let filename_ptr = unsafe { ctx_ptr.add(filename_offset) };
@@ -483,7 +491,7 @@ fn try_exit(_ctx: &TracePointContext) -> Result<u32, i64> {
 
     if let Some(mut entry) = EVENTS.reserve::<Event>(0) {
         let event = unsafe { &mut *entry.as_mut_ptr() };
-        event.kind = EventKind::ProcessExit;
+        event.kind = EventKind::ProcessExit as u32;
         event.source = 0;
         event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
 

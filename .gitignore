@@ -10,7 +10,9 @@ result
 *.fdb_latexmk
 *.fls
 *.log
+*.out
 repx_paper.pdf
 
 # Attestation (generated/derived)
 attestation.json
+/repx-attestation.json

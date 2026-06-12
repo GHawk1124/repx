@@ -192,8 +192,43 @@
 
         test-nix-build-script = pkgs.writeShellApplication {
           name = "repx-test-nix-build";
-          runtimeInputs = [ repx pkgs.gcc pkgs.coreutils ];
+          runtimeInputs = [ repx pkgs.gcc pkgs.coreutils pkgs.python3 ];
           text = builtins.readFile ./tests/run-nix-build-test.sh;
+        };
+
+        test-bazel-script = pkgs.writeShellApplication {
+          name = "repx-test-bazel";
+          runtimeInputs = [ repx pkgs.bazel pkgs.gcc pkgs.coreutils pkgs.python3 ];
+          text = builtins.readFile ./tests/run-bazel-test.sh;
+        };
+
+        test-build-systems-script = pkgs.writeShellApplication {
+          name = "repx-test-build-systems";
+          runtimeInputs = [
+            repx
+            pkgs.cargo
+            pkgs.cmake
+            pkgs.coreutils
+            pkgs.gcc
+            pkgs.gnugrep
+            pkgs.go
+            pkgs.gnumake
+            pkgs.ninja
+            pkgs.python3
+            pkgs.rustc
+          ];
+          text = builtins.readFile ./tests/run-build-system-tests.sh;
+        };
+
+        test-determinism-script = pkgs.writeShellApplication {
+          name = "repx-test-determinism";
+          runtimeInputs = [
+            test-script
+            test-nix-build-script
+            test-bazel-script
+            test-build-systems-script
+          ];
+          text = builtins.readFile ./tests/run-determinism-test.sh;
         };
 
         demo-attack-script = pkgs.writeShellApplication {
@@ -231,6 +266,18 @@
 
         apps.test-nix-build = flake-utils.lib.mkApp {
           drv = test-nix-build-script;
+        };
+
+        apps.test-bazel = flake-utils.lib.mkApp {
+          drv = test-bazel-script;
+        };
+
+        apps.test-build-systems = flake-utils.lib.mkApp {
+          drv = test-build-systems-script;
+        };
+
+        apps.test-determinism = flake-utils.lib.mkApp {
+          drv = test-determinism-script;
         };
 
         apps.demo-attack = flake-utils.lib.mkApp {

@@ -8,7 +8,7 @@ set -euo pipefail
 #
 # Scenario: An attacker compromises the build system and injects a backdoor
 # into the build process. The source code looks clean. The SBOM looks clean.
-# But repx sees everything that actually happened at the kernel level.
+# repx records the covered kernel events and detects this attack path.
 #
 # Usage:
 #   sudo nix run .#demo-attack
@@ -135,13 +135,15 @@ echo "  src/crypto.c   - XOR cipher implementation"
 echo "  src/main.c     - demo program"
 echo "  build.sh       - build script"
 
+cd "$TMPDIR"
+
 # --------------------------------------------------------------------------
 banner "STEP 2: Produce a trusted attestation (clean build)"
 # --------------------------------------------------------------------------
 
-info "Running: repx trace -- ./build.sh src/ build/"
+info "Running: repx trace --output-root build -- ./build.sh src/ build/"
 echo ""
-"$REPX" trace -o "$TMPDIR/attestation.json" -- \
+"$REPX" trace --output-root build -o "$TMPDIR/attestation.json" -- \
     "$TMPDIR/build.sh" "$TMPDIR/src" "$TMPDIR/build"
 
 echo ""
@@ -165,9 +167,9 @@ banner "STEP 3: Verify the clean build (should pass)"
 rm -rf "$TMPDIR/build"
 mkdir -p "$TMPDIR/build"
 
-info "Running: repx verify -- ./build.sh src/ build/"
+info "Running: repx verify --output-root build -- ./build.sh src/ build/"
 echo ""
-"$REPX" verify -a "$TMPDIR/attestation.json" -- \
+"$REPX" verify --output-root build -a "$TMPDIR/attestation.json" -- \
     "$TMPDIR/build.sh" "$TMPDIR/src" "$TMPDIR/build"
 
 echo ""
@@ -216,11 +218,11 @@ banner "STEP 5: Verify the compromised build (should FAIL)"
 rm -rf "$TMPDIR/build"
 mkdir -p "$TMPDIR/build"
 
-info "Running: repx verify -- ./build.sh src/ build/"
+info "Running: repx verify --output-root build -- ./build.sh src/ build/"
 warn "The build script now contains a backdoor..."
 echo ""
 
-if "$REPX" verify -a "$TMPDIR/attestation.json" -- \
+if "$REPX" verify --output-root build -a "$TMPDIR/attestation.json" -- \
     "$TMPDIR/build.sh" "$TMPDIR/src" "$TMPDIR/build" 2>&1; then
     bad "ERROR: Verification should have failed!"
     exit 1
@@ -253,8 +255,8 @@ echo "  3. The source code was never changed"
 echo "  4. A traditional SBOM would show no difference"
 echo ""
 good "  But repx detected the attack because:"
-echo "  - The build script's content hash changed (different file was read)"
-echo "  - An extra file (.keys) was opened and written"
+echo "  - The build script's tool hash changed"
+echo "  - The selected build output set gained .keys"
 echo "  - The process attestation hash no longer matches"
 echo ""
 
@@ -266,9 +268,8 @@ info "Clean build hash:        $CLEAN_HASH"
 bad  "Compromised build hash:  (different - verification failed)"
 echo ""
 info "repx provides a Software Bill of Process (SBOP) -"
-info "a cryptographic proof of EVERYTHING that happened during a build."
-info "Not just what's in the binary. Not just what packages were used."
-info "Every file read, every file written, every process spawned."
+info "a deterministic commitment to the covered build operations."
+info "For this attack, that includes the changed script and extra output."
 echo ""
-good "SolarWinds-style attacks can't hide from kernel-level attestation."
+good "This covered build-script injection was detected by kernel-level attestation."
 echo ""

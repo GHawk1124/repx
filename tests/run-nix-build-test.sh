@@ -48,8 +48,22 @@ fi
 
 echo "Using repx: $REPX"
 
+DETERMINISM_RUNS="${DETERMINISM_RUNS:-2}"
+if ! [[ "$DETERMINISM_RUNS" =~ ^[0-9]+$ ]] || [ "$DETERMINISM_RUNS" -lt 2 ]; then
+    echo "ERROR: DETERMINISM_RUNS must be an integer of at least 2."
+    exit 1
+fi
+
 TMPDIR=$(mktemp -d)
-trap 'rm -rf $TMPDIR' EXIT
+cleanup_tmpdir() {
+    local status=$?
+    if [ "${KEEP_TMPDIR:-0}" = "1" ] || [ "$status" -ne 0 ]; then
+        echo "Keeping temp workspace: $TMPDIR"
+    else
+        rm -rf "$TMPDIR"
+    fi
+}
+trap cleanup_tmpdir EXIT
 
 echo "=== Setting up multi-file C project ==="
 
@@ -111,10 +125,12 @@ chmod +x "$TMPDIR/build.sh"
 
 echo "Created multi-file C project in $TMPDIR/src/"
 echo "Files: math.h, math.c, main.c, build.sh"
+cd "$TMPDIR"
 
 echo ""
 echo "=== Trace: building project under repx ==="
-"$REPX" trace -o "$TMPDIR/attestation.json" -- \
+"$REPX" trace --output-root "$TMPDIR/build" \
+    --dump-ops "$TMPDIR/trace-ops.json" -o "$TMPDIR/attestation.json" -- \
     "$TMPDIR/build.sh" "$TMPDIR/src" "$TMPDIR/build"
 
 echo ""
@@ -127,12 +143,37 @@ echo "=== Attestation root hash ==="
 head -5 "$TMPDIR/attestation.json"
 
 echo ""
-echo "=== Verify: re-running the exact same build ==="
-# Clean build artifacts so the build runs fresh.
+echo "=== Determinism: repeating the exact same build ==="
+attestations=("$TMPDIR/attestation.json")
+for ((run = 2; run <= DETERMINISM_RUNS; run++)); do
+    rm -rf "$TMPDIR/build"
+    mkdir -p "$TMPDIR/build"
+
+    run_attestation="$TMPDIR/run-$run-attestation.json"
+    attestations+=("$run_attestation")
+    if ! "$REPX" trace --output-root "$TMPDIR/build" \
+        --dump-ops "$TMPDIR/run-$run-ops.json" \
+        -o "$run_attestation" -- \
+        "$TMPDIR/build.sh" "$TMPDIR/src" "$TMPDIR/build"; then
+        echo "ERROR: trace run $run failed"
+        exit 1
+    fi
+done
+
+"$REPX" stability --json "${attestations[@]}" > "$TMPDIR/stability.json"
+if ! "$REPX" stability --strict "${attestations[@]}"; then
+    for candidate in "${attestations[@]:1}"; do
+        "$REPX" diff "$TMPDIR/attestation.json" "$candidate" || true
+    done
+    echo "ERROR: clean traces were not deterministic"
+    exit 1
+fi
+
 rm -rf "$TMPDIR/build"
 mkdir -p "$TMPDIR/build"
 
-"$REPX" verify -a "$TMPDIR/attestation.json" -- \
+"$REPX" verify --output-root "$TMPDIR/build" \
+    -a "$TMPDIR/attestation.json" -- \
     "$TMPDIR/build.sh" "$TMPDIR/src" "$TMPDIR/build"
 
 echo ""

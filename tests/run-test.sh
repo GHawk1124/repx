@@ -43,8 +43,22 @@ fi
 
 echo "Using repx: $REPX"
 
+DETERMINISM_RUNS="${DETERMINISM_RUNS:-2}"
+if ! [[ "$DETERMINISM_RUNS" =~ ^[0-9]+$ ]] || [ "$DETERMINISM_RUNS" -lt 2 ]; then
+    echo "ERROR: DETERMINISM_RUNS must be an integer of at least 2."
+    exit 1
+fi
+
 TMPDIR=$(mktemp -d)
-trap 'rm -rf $TMPDIR' EXIT
+cleanup_tmpdir() {
+    local status=$?
+    if [ "${KEEP_TMPDIR:-0}" = "1" ] || [ "$status" -ne 0 ]; then
+        echo "Keeping temp workspace: $TMPDIR"
+    else
+        rm -rf "$TMPDIR"
+    fi
+}
+trap cleanup_tmpdir EXIT
 
 echo "=== Setting up test ==="
 
@@ -92,6 +106,19 @@ echo ""
 echo "=== Attestation ==="
 head -20 "$TMPDIR/attestation.json"
 echo "..."
+
+echo ""
+echo "=== Determinism: repeating the same command ==="
+attestations=("$TMPDIR/attestation.json")
+for ((run = 2; run <= DETERMINISM_RUNS; run++)); do
+    rm -f "$TMPDIR/output.txt"
+    run_attestation="$TMPDIR/run-$run-attestation.json"
+    attestations+=("$run_attestation")
+    "$REPX" trace -o "$run_attestation" -- \
+        "$TMPDIR/hello" "$TMPDIR/input.txt" "$TMPDIR/output.txt"
+done
+"$REPX" stability --json "${attestations[@]}" > "$TMPDIR/stability.json"
+"$REPX" stability --strict "${attestations[@]}"
 
 echo ""
 echo "=== Verify: re-running hello and comparing attestation ==="
