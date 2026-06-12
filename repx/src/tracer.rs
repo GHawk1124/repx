@@ -742,6 +742,42 @@ fn process_event(
     true
 }
 
+fn drain_ring_into_buffer(
+    ring_buf: &mut RingBuf<&mut aya::maps::MapData>,
+    raw_events: &mut Vec<(u64, Vec<u8>)>,
+    malformed: &mut u64,
+) {
+    while let Some(item) = ring_buf.next() {
+        let data = item.as_ref();
+        if data.len() < std::mem::size_of::<Event>() {
+            warn!("Short event: {} bytes", data.len());
+            *malformed = malformed.saturating_add(1);
+            continue;
+        }
+        // timestamp_ns is at offset 8 in the repr(C) Event struct.
+        let ts = u64::from_ne_bytes(<[u8; 8]>::try_from(&data[8..16]).unwrap());
+        raw_events.push((ts, data.to_vec()));
+    }
+}
+
+fn process_buffered_events(
+    raw_events: &[(u64, Vec<u8>)],
+    events: &mut Vec<TracedEvent>,
+    state: &mut EventCollectorState,
+    watch_prefixes: &[String],
+) {
+    for (_, data) in raw_events {
+        if data.len() < std::mem::size_of::<Event>() {
+            state.malformed_events = state.malformed_events.saturating_add(1);
+            continue;
+        }
+        let event = unsafe { (data.as_ptr() as *const Event).read_unaligned() };
+        if !process_event(&event, events, state, watch_prefixes) {
+            state.malformed_events = state.malformed_events.saturating_add(1);
+        }
+    }
+}
+
 fn collect_events(
     mut ring_buf: RingBuf<&mut aya::maps::MapData>,
     child_pid: u32,
@@ -749,30 +785,24 @@ fn collect_events(
     state: &mut EventCollectorState,
     watch_prefixes: &[String],
 ) -> Result<()> {
+    // Buffer events with their timestamps instead of processing immediately.
+    // Per-CPU ring buffers are drained in non-deterministic order, which can
+    // cause a FileClose from one CPU to be processed before its matching
+    // FileOpen from another CPU.  Sorting by bpf_ktime_get_ns() timestamp
+    // restores the global syscall order and makes the trace deterministic.
+    let mut raw_events: Vec<(u64, Vec<u8>)> = Vec::new();
+
     loop {
-        // Poll the ring buffer.
-        while let Some(item) = ring_buf.next() {
-            let data = item.as_ref();
-            if data.len() < std::mem::size_of::<Event>() {
-                warn!("Short event: {} bytes", data.len());
-                state.malformed_events = state.malformed_events.saturating_add(1);
-                continue;
-            }
+        drain_ring_into_buffer(&mut ring_buf, &mut raw_events, &mut state.malformed_events);
 
-            let event = unsafe { (data.as_ptr() as *const Event).read_unaligned() };
-            if !process_event(&event, events, state, watch_prefixes) {
-                state.malformed_events = state.malformed_events.saturating_add(1);
-            }
-        }
-
-        // Check if the child has exited.
         match waitpid(Pid::from_raw(child_pid as i32), Some(WaitPidFlag::WNOHANG))? {
             WaitStatus::Exited(_, real_exit_code) => {
                 info!("Child exited with status {}", real_exit_code);
-                finish_child_exit(
-                    ring_buf,
+                finish_with_sort(
+                    &mut ring_buf,
                     child_pid,
                     real_exit_code,
+                    &mut raw_events,
                     events,
                     state,
                     watch_prefixes,
@@ -782,10 +812,11 @@ fn collect_events(
             WaitStatus::Signaled(_, signal, _) => {
                 let real_exit_code = 128 + signal as i32;
                 info!("Child exited from signal {}", signal);
-                finish_child_exit(
-                    ring_buf,
+                finish_with_sort(
+                    &mut ring_buf,
                     child_pid,
                     real_exit_code,
+                    &mut raw_events,
                     events,
                     state,
                     watch_prefixes,
@@ -802,51 +833,38 @@ fn collect_events(
     Ok(())
 }
 
-fn finish_child_exit(
-    mut ring_buf: RingBuf<&mut aya::maps::MapData>,
+/// Quiescence drain → timestamp sort → process → synthesize exit.
+fn finish_with_sort(
+    ring_buf: &mut RingBuf<&mut aya::maps::MapData>,
     child_pid: u32,
     real_exit_code: i32,
+    raw_events: &mut Vec<(u64, Vec<u8>)>,
     events: &mut Vec<TracedEvent>,
     state: &mut EventCollectorState,
     watch_prefixes: &[String],
 ) -> Result<()> {
-    // Allow a short quiescence window for sibling watch-mode events that race
-    // with the traced child's exit.
+    // Let late events land before we sort.
     let quiescence = std::time::Duration::from_millis(100);
     let poll_interval = std::time::Duration::from_millis(10);
     let mut deadline = std::time::Instant::now() + quiescence;
-
     loop {
-        let mut saw_event = false;
-
-        while let Some(item) = ring_buf.next() {
-            let data = item.as_ref();
-            if data.len() >= std::mem::size_of::<Event>() {
-                let event = unsafe { (data.as_ptr() as *const Event).read_unaligned() };
-                if !process_event(&event, events, state, watch_prefixes) {
-                    state.malformed_events = state.malformed_events.saturating_add(1);
-                }
-                saw_event = true;
-            } else {
-                warn!("Short event: {} bytes", data.len());
-                state.malformed_events = state.malformed_events.saturating_add(1);
-            }
-        }
-
-        if saw_event {
+        let before = raw_events.len();
+        drain_ring_into_buffer(ring_buf, raw_events, &mut state.malformed_events);
+        if raw_events.len() > before {
             deadline = std::time::Instant::now() + quiescence;
         }
-
         if std::time::Instant::now() >= deadline {
             break;
         }
-
-        wait_for_ring_event(&ring_buf, poll_interval.as_millis() as i32)?;
+        wait_for_ring_event(ring_buf, poll_interval.as_millis() as i32)?;
     }
 
-    // Patch the child's exit event with the real exit code from waitpid().
-    // BPF can't reliably read exit_code from task_struct, so we use waitpid,
-    // which is authoritative.
+    // Sort by bpf_ktime_get_ns timestamp for deterministic processing.
+    raw_events.sort_unstable_by_key(|(ts, _)| *ts);
+    process_buffered_events(raw_events, events, state, watch_prefixes);
+
+    // Synthesize the root exit event (BPF exit events cannot reliably
+    // carry the real exit code).
     let mut found_exit = false;
     for ev in events.iter_mut().rev() {
         if let TracedEvent::Exit {
@@ -860,8 +878,6 @@ fn finish_child_exit(
             }
         }
     }
-
-    // If BPF missed the exit event, synthesize one.
     if !found_exit {
         let process = state.exit_process(child_pid);
         events.push(TracedEvent::Exit {
