@@ -84,6 +84,10 @@ pub fn canonicalize_output_slice(
                     }
                 }
                 if can_write {
+                    eprintln!(
+                        "DEBUG SLICE FileOpen write: process=(pid={}, gen={}) fd={} path={} flags={:#x}",
+                        process.lifetime.pid, process.lifetime.generation, fd, path, flags
+                    );
                     pending_writes.insert((process.lifetime, fd), PendingWrite { process, path });
                 }
             }
@@ -130,8 +134,17 @@ pub fn canonicalize_output_slice(
                 }
 
                 let pending_write = pending_writes.remove(&(process.lifetime, fd));
+                eprintln!(
+                    "DEBUG SLICE FileClose: process=(pid={}, gen={}) fd={} has_pending={} has_obs={} path={:?}",
+                    process.lifetime.pid, process.lifetime.generation, fd,
+                    pending_write.is_some(), observation.is_some(), path
+                );
                 if let (Some(pending_write), Some(observation)) = (pending_write, observation) {
                     let path = path.unwrap_or(pending_write.path);
+                    eprintln!(
+                        "DEBUG SLICE FileClose WRITER: path={} process=(pid={}, gen={})",
+                        path, pending_write.process.lifetime.pid, pending_write.process.lifetime.generation
+                    );
                     writers_by_path
                         .entry(path)
                         .or_default()

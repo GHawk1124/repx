@@ -408,12 +408,21 @@ fn process_event(
             let payload = unsafe { &event.payload.file_open };
             let external = event.source == 1;
             let process_id = payload.tgid;
-            let process = state.current_process(process_id);
             let path_len = (payload.path_len as usize).min(payload.path.len());
             let raw_path = std::str::from_utf8(&payload.path[..path_len])
                 .unwrap_or("<invalid utf8>")
                 .trim_end_matches('\0')
                 .to_string();
+            let can_write = (payload.flags & 0x3) != 0;
+            eprintln!(
+                "DEBUG FileOpen raw: tgid={} fd={} flags={:#x} can_write={} path={} external={}",
+                process_id, payload.fd, payload.flags, can_write, raw_path, external
+            );
+            let process = state.current_process(process_id);
+            eprintln!(
+                "DEBUG FileOpen resolved: process=(pid={}, gen={})",
+                process.lifetime.pid, process.lifetime.generation
+            );
 
             let raw_resolved = state.resolve_path(process, payload.dfd, &raw_path);
             let proc_fd_path = format!("/proc/{}/fd/{}", payload.tgid, payload.fd);
@@ -712,7 +721,18 @@ fn process_event(
         }
         EventKind::ProcessFork => {
             let payload = unsafe { &event.payload.process_fork };
+            eprintln!(
+                "DEBUG ProcessFork raw: parent_pid={} child_pid={}",
+                payload.parent_pid, payload.child_pid
+            );
             let (parent, child) = state.fork_process(payload.parent_pid, payload.child_pid);
+            eprintln!(
+                "DEBUG ProcessFork resolved: parent=(pid={}, gen={}) child=(pid={}, gen={})",
+                parent.lifetime.pid,
+                parent.lifetime.generation,
+                child.lifetime.pid,
+                child.lifetime.generation
+            );
             debug!(
                 "Fork parent={} generation={} epoch={} child={} generation={}",
                 parent.lifetime.pid,
