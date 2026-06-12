@@ -23,6 +23,402 @@ use crate::file_identity::{
 /// AT_FDCWD sentinel: openat interprets relative paths against the cwd.
 const AT_FDCWD: i32 = -100;
 
+// ---------------------------------------------------------------------------
+// Kernel-portable tracepoint field offset discovery
+//
+// Raw tracepoint format fields are NOT covered by BTF/CO-RE.  The offset of
+// each field within the raw tracepoint record varies across architectures and
+// kernel configurations.  We discover the real offsets at load time by parsing
+// the format files under /sys/kernel/debug/tracing/events/.../format.
+// ---------------------------------------------------------------------------
+
+/// One discovered field offset: maps a constant key (defined in repx-common's
+/// tp_offsets module) to a byte offset read from the kernel's format file.
+struct OffsetSpec {
+    key: u32,
+    system: &'static str,
+    event: &'static str,
+    field: &'static str,
+    required: bool,
+}
+
+/// Every tracepoint-field pair we read from eBPF, cross-referenced against the
+/// kernel's format-file description.  The key constants live in repx-common so
+/// that the eBPF program (no_std) and userspace share the same encoding.
+const ALL_OFFSET_SPECS: &[OffsetSpec] = &[
+    // sys_enter_openat
+    OffsetSpec {
+        key: repx_common::tp_offsets::OPENAT_ENTER_DFD,
+        system: "syscalls",
+        event: "sys_enter_openat",
+        field: "dfd",
+        required: true,
+    },
+    OffsetSpec {
+        key: repx_common::tp_offsets::OPENAT_ENTER_FILENAME,
+        system: "syscalls",
+        event: "sys_enter_openat",
+        field: "filename",
+        required: true,
+    },
+    OffsetSpec {
+        key: repx_common::tp_offsets::OPENAT_ENTER_FLAGS,
+        system: "syscalls",
+        event: "sys_enter_openat",
+        field: "flags",
+        required: true,
+    },
+    // sys_exit_openat
+    OffsetSpec {
+        key: repx_common::tp_offsets::OPENAT_EXIT_RET,
+        system: "syscalls",
+        event: "sys_exit_openat",
+        field: "ret",
+        required: true,
+    },
+    // sys_enter_rename
+    OffsetSpec {
+        key: repx_common::tp_offsets::RENAME_ENTER_OLD_PATH,
+        system: "syscalls",
+        event: "sys_enter_rename",
+        field: "oldname",
+        required: true,
+    },
+    OffsetSpec {
+        key: repx_common::tp_offsets::RENAME_ENTER_NEW_PATH,
+        system: "syscalls",
+        event: "sys_enter_rename",
+        field: "newname",
+        required: true,
+    },
+    // sys_enter_renameat
+    OffsetSpec {
+        key: repx_common::tp_offsets::RENAMEAT_ENTER_OLD_DFD,
+        system: "syscalls",
+        event: "sys_enter_renameat",
+        field: "olddfd",
+        required: true,
+    },
+    OffsetSpec {
+        key: repx_common::tp_offsets::RENAMEAT_ENTER_OLD_PATH,
+        system: "syscalls",
+        event: "sys_enter_renameat",
+        field: "oldname",
+        required: true,
+    },
+    OffsetSpec {
+        key: repx_common::tp_offsets::RENAMEAT_ENTER_NEW_DFD,
+        system: "syscalls",
+        event: "sys_enter_renameat",
+        field: "newdfd",
+        required: true,
+    },
+    OffsetSpec {
+        key: repx_common::tp_offsets::RENAMEAT_ENTER_NEW_PATH,
+        system: "syscalls",
+        event: "sys_enter_renameat",
+        field: "newname",
+        required: true,
+    },
+    // sys_enter_renameat2 — dfd/path keys reuse renameat entries since the
+    // first four arguments share the same layout on all architectures.
+    OffsetSpec {
+        key: repx_common::tp_offsets::RENAMEAT2_ENTER_FLAGS,
+        system: "syscalls",
+        event: "sys_enter_renameat2",
+        field: "flags",
+        required: true,
+    },
+    // sys_enter_unlink
+    OffsetSpec {
+        key: repx_common::tp_offsets::UNLINK_ENTER_PATH,
+        system: "syscalls",
+        event: "sys_enter_unlink",
+        field: "pathname",
+        required: true,
+    },
+    // sys_enter_unlinkat
+    OffsetSpec {
+        key: repx_common::tp_offsets::UNLINKAT_ENTER_DFD,
+        system: "syscalls",
+        event: "sys_enter_unlinkat",
+        field: "dfd",
+        required: true,
+    },
+    OffsetSpec {
+        key: repx_common::tp_offsets::UNLINKAT_ENTER_PATH,
+        system: "syscalls",
+        event: "sys_enter_unlinkat",
+        field: "pathname",
+        required: true,
+    },
+    OffsetSpec {
+        key: repx_common::tp_offsets::UNLINKAT_ENTER_FLAGS,
+        system: "syscalls",
+        event: "sys_enter_unlinkat",
+        field: "flag",
+        required: true,
+    },
+    // sys_enter_close
+    OffsetSpec {
+        key: repx_common::tp_offsets::CLOSE_ENTER_FD,
+        system: "syscalls",
+        event: "sys_enter_close",
+        field: "fd",
+        required: true,
+    },
+    // sys_enter_mmap
+    OffsetSpec {
+        key: repx_common::tp_offsets::MMAP_ENTER_PROT,
+        system: "syscalls",
+        event: "sys_enter_mmap",
+        field: "prot",
+        required: true,
+    },
+    OffsetSpec {
+        key: repx_common::tp_offsets::MMAP_ENTER_FLAGS,
+        system: "syscalls",
+        event: "sys_enter_mmap",
+        field: "flags",
+        required: true,
+    },
+    OffsetSpec {
+        key: repx_common::tp_offsets::MMAP_ENTER_FD,
+        system: "syscalls",
+        event: "sys_enter_mmap",
+        field: "fd",
+        required: true,
+    },
+    // sys_exit_rename
+    OffsetSpec {
+        key: repx_common::tp_offsets::RENAME_EXIT_RET,
+        system: "syscalls",
+        event: "sys_exit_rename",
+        field: "ret",
+        required: true,
+    },
+    // sys_exit_renameat
+    OffsetSpec {
+        key: repx_common::tp_offsets::RENAMEAT_EXIT_RET,
+        system: "syscalls",
+        event: "sys_exit_renameat",
+        field: "ret",
+        required: true,
+    },
+    // sys_exit_renameat2
+    OffsetSpec {
+        key: repx_common::tp_offsets::RENAMEAT2_EXIT_RET,
+        system: "syscalls",
+        event: "sys_exit_renameat2",
+        field: "ret",
+        required: true,
+    },
+    // sys_exit_unlink
+    OffsetSpec {
+        key: repx_common::tp_offsets::UNLINK_EXIT_RET,
+        system: "syscalls",
+        event: "sys_exit_unlink",
+        field: "ret",
+        required: true,
+    },
+    // sys_exit_unlinkat
+    OffsetSpec {
+        key: repx_common::tp_offsets::UNLINKAT_EXIT_RET,
+        system: "syscalls",
+        event: "sys_exit_unlinkat",
+        field: "ret",
+        required: true,
+    },
+    // sched_process_exec
+    OffsetSpec {
+        key: repx_common::tp_offsets::EXEC_DATA_LOC_FILENAME,
+        system: "sched",
+        event: "sched_process_exec",
+        field: "filename",
+        required: true,
+    },
+    // sched_process_fork
+    OffsetSpec {
+        key: repx_common::tp_offsets::FORK_CHILD_PID,
+        system: "sched",
+        event: "sched_process_fork",
+        field: "child_pid",
+        required: true,
+    },
+    // Best-effort: sys_exit_clone, sys_exit_clone3
+    OffsetSpec {
+        key: repx_common::tp_offsets::CLONE_EXIT_RET,
+        system: "syscalls",
+        event: "sys_exit_clone",
+        field: "ret",
+        required: false,
+    },
+    OffsetSpec {
+        key: repx_common::tp_offsets::CLONE3_EXIT_RET,
+        system: "syscalls",
+        event: "sys_exit_clone3",
+        field: "ret",
+        required: false,
+    },
+];
+
+/// Parse one line of a tracepoint format file and return the byte offset of
+/// the named field, or None if this line doesn't describe `target_name`.
+///
+/// Format-file lines look like:
+///   field:int dfd; offset:16; size:4; signed:1;
+///   field:const char * filename; offset:24; size:8; signed:0;
+/// The field name is always the last whitespace-delimited token before the
+/// first semicolon; the offset is the decimal after "offset:".
+fn parse_format_field_offset(line: &str, target_name: &str) -> Option<u32> {
+    let line = line.trim();
+    if !line.starts_with("field:") {
+        return None;
+    }
+    // "field:TYPE NAME; ... offset:N; ..."
+    let after_field = line.strip_prefix("field:").unwrap();
+    let semicolon_pos = after_field.find(';')?;
+    let field_decl = &after_field[..semicolon_pos];
+    let name = field_decl.split_whitespace().last()?;
+    if name != target_name {
+        return None;
+    }
+    // Find "offset:N;" after the field name.
+    let rest = &after_field[semicolon_pos..];
+    let offset_start = rest.find("offset:")?;
+    let after_offset = &rest[offset_start + 7..];
+    let end = after_offset.find(';')?;
+    let offset_str = after_offset[..end].trim();
+    offset_str.parse::<u32>().ok()
+}
+
+/// Discover all tracepoint field offsets from the kernel's format files.
+///
+/// Reads /sys/kernel/debug/tracing/events/{system}/{event}/format for each
+/// entry in `ALL_OFFSET_SPECS`, extracts the byte offset of the named field,
+/// and returns a key→offset map ready to be inserted into the BPF map.
+///
+/// **Fail-closed**: any required field that cannot be found causes an error.
+/// Best-effort fields (clone, clone3) are silently skipped when absent.
+///
+/// When debugfs is unavailable, checks the `REPX_FALLBACK_OFFSETS` or `CI`
+/// environment variables; if either is set, uses built-in x86-64 offsets and
+/// emits a warning instead of failing.
+fn discover_tracepoint_offsets() -> Result<HashMap<u32, u32>> {
+    let debugfs_events = Path::new("/sys/kernel/debug/tracing/events");
+
+    if !debugfs_events.exists() {
+        if std::env::var("REPX_FALLBACK_OFFSETS").is_ok()
+            || std::env::var("CI").is_ok()
+        {
+            warn!(
+                "{} not found; using built-in x86-64 fallback offsets \
+                 (traceportable offsets require debugfs)",
+                debugfs_events.display()
+            );
+            return Ok(fallback_offsets());
+        }
+        bail!(
+            "{} not found.\n\
+             Mount debugfs to enable portable tracepoint field discovery:\n\
+             $ mount -t debugfs none /sys/kernel/debug\n\
+             Set REPX_FALLBACK_OFFSETS=1 to use built-in x86-64 offsets \
+             (not portable across architectures or kernel configs).",
+            debugfs_events.display()
+        );
+    }
+
+    let mut offsets = HashMap::new();
+
+    for spec in ALL_OFFSET_SPECS {
+        let format_path = debugfs_events.join(spec.system).join(spec.event).join("format");
+        let content = match std::fs::read_to_string(&format_path) {
+            Ok(c) => c,
+            Err(e) => {
+                if spec.required {
+                    bail!(
+                        "cannot read tracepoint format file {}: {}",
+                        format_path.display(),
+                        e
+                    );
+                }
+                warn!(
+                    "cannot read {}: {} (skipping optional field)",
+                    format_path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        let found_offset = content
+            .lines()
+            .find_map(|line| parse_format_field_offset(line, spec.field));
+
+        match found_offset {
+            Some(offset) => {
+                debug!(
+                    "tracepoint offset: {}/{} field '{}' = {}",
+                    spec.system, spec.event, spec.field, offset
+                );
+                offsets.insert(spec.key, offset);
+            }
+            None => {
+                if spec.required {
+                    bail!(
+                        "required field '{}' not found in {}",
+                        spec.field,
+                        format_path.display()
+                    );
+                }
+                warn!(
+                    "field '{}' not found in {} (skipping optional field)",
+                    spec.field, format_path.display()
+                );
+            }
+        }
+    }
+
+    Ok(offsets)
+}
+
+/// Built-in x86-64 fallback offsets for CI environments where debugfs is
+/// not available.  These match a typical x86-64 Linux 5.x / 6.x kernel and
+/// are NOT portable across architectures.
+fn fallback_offsets() -> HashMap<u32, u32> {
+    use repx_common::tp_offsets::*;
+    let mut m = HashMap::new();
+    m.insert(OPENAT_ENTER_DFD, 16);
+    m.insert(OPENAT_ENTER_FILENAME, 24);
+    m.insert(OPENAT_ENTER_FLAGS, 32);
+    m.insert(OPENAT_EXIT_RET, 16);
+    m.insert(RENAME_ENTER_OLD_PATH, 16);
+    m.insert(RENAME_ENTER_NEW_PATH, 24);
+    m.insert(RENAMEAT_ENTER_OLD_DFD, 16);
+    m.insert(RENAMEAT_ENTER_OLD_PATH, 24);
+    m.insert(RENAMEAT_ENTER_NEW_DFD, 32);
+    m.insert(RENAMEAT_ENTER_NEW_PATH, 40);
+    m.insert(RENAMEAT2_ENTER_FLAGS, 48);
+    m.insert(UNLINK_ENTER_PATH, 16);
+    m.insert(UNLINKAT_ENTER_DFD, 16);
+    m.insert(UNLINKAT_ENTER_PATH, 24);
+    m.insert(UNLINKAT_ENTER_FLAGS, 32);
+    m.insert(CLOSE_ENTER_FD, 16);
+    m.insert(MMAP_ENTER_PROT, 32);
+    m.insert(MMAP_ENTER_FLAGS, 40);
+    m.insert(MMAP_ENTER_FD, 48);
+    m.insert(EXEC_DATA_LOC_FILENAME, 8);
+    m.insert(FORK_CHILD_PID, 44);
+    m.insert(CLONE_EXIT_RET, 16);
+    m.insert(CLONE3_EXIT_RET, 16);
+    m.insert(RENAME_EXIT_RET, 16);
+    m.insert(RENAMEAT_EXIT_RET, 16);
+    m.insert(RENAMEAT2_EXIT_RET, 16);
+    m.insert(UNLINK_EXIT_RET, 16);
+    m.insert(UNLINKAT_EXIT_RET, 16);
+    m
+}
+
 /// One kernel process lifetime. The generation distinguishes PID reuse within
 /// a trace without making scheduler-assigned values part of the commitment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -166,6 +562,22 @@ pub fn trace_command(command: &[String], watch_dirs: &[PathBuf]) -> Result<Trace
 
     let ebpf_bytes = load_ebpf()?;
     let mut bpf = Ebpf::load(&ebpf_bytes).context("Failed to load eBPF program")?;
+
+    // Discover tracepoint field offsets from /sys/kernel/debug/tracing/events/...
+    // and populate the TRACEPOINT_OFFSETS map BEFORE any tracepoint is attached.
+    // This makes field accesses portable across architectures and kernel configs.
+    {
+        let offsets = discover_tracepoint_offsets()?;
+        let mut offsets_map: BpfHashMap<_, u32, u32> =
+            BpfHashMap::try_from(bpf.map_mut("TRACEPOINT_OFFSETS").unwrap())
+                .context("Failed to get TRACEPOINT_OFFSETS map")?;
+        for (key, offset) in &offsets {
+            offsets_map
+                .insert(*key, *offset, 0)
+                .with_context(|| format!("Failed to insert offset key={} value={}", key, offset))?;
+        }
+        info!("Populated {} tracepoint field offsets", offsets.len());
+    }
 
     // Attach all tracepoints.
     attach_tracepoint(

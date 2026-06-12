@@ -48,6 +48,13 @@ static PATH_OP_NEW_PATH: HashMap<u64, PathStash> = HashMap::with_max_entries(409
 #[map]
 static DROP_COUNT: HashMap<u32, u64> = HashMap::with_max_entries(1, 0);
 
+/// Tracepoint field offsets discovered at load time.
+/// Key: tp_offsets constant, Value: byte offset from raw tracepoint data start.
+/// Populated by userspace before any tracepoint is attached.
+#[map]
+static TRACEPOINT_OFFSETS: HashMap<u32, u32> =
+    HashMap::with_max_entries(repx_common::tp_offsets::MAX_OFFSET_KEY as u32, 0);
+
 /// Flag to enable system-wide file monitoring (0=disabled, 1=enabled).
 /// Key: 0, Value: 1 if watch mode active.
 #[map]
@@ -120,6 +127,22 @@ fn record_drop() {
     let key: u32 = 0;
     let count = unsafe { DROP_COUNT.get(&key) }.copied().unwrap_or(0);
     let _ = DROP_COUNT.insert(&key, &(count + 1), 0);
+}
+
+/// Read a tracepoint field at the runtime-discovered offset for `key`.
+///
+/// The offset was determined before attach by parsing the tracepoint format
+/// file in /sys/kernel/debug/tracing/events/.../format and stored in the
+/// TRACEPOINT_OFFSETS map by userspace.
+#[inline(always)]
+fn read_field<T: Copy>(ctx: &TracePointContext, key: u32) -> Result<T, i64> {
+    let offset = unsafe { TRACEPOINT_OFFSETS.get(&key) }
+        .copied()
+        .unwrap_or(0) as usize;
+    if offset == 0 {
+        return Err(-1);
+    }
+    unsafe { ctx.read_at(offset) }
 }
 
 /// Check whether a path matches any of the watched prefixes.
@@ -375,16 +398,10 @@ fn try_openat_enter(ctx: &TracePointContext) -> Result<u32, i64> {
 
     let tracked = is_tracked(tgid);
 
-    // sys_enter_openat layout (x86-64):
-    //   offset  0: common fields (8 bytes)
-    //   offset  8: __syscall_nr  (int, 4 bytes + 4 pad)
-    //   offset 16: dfd           (unsigned long, 8 bytes)
-    //   offset 24: filename      (pointer,       8 bytes)
-    //   offset 32: flags         (unsigned long, 8 bytes)
-    //   offset 40: mode          (umode_t,       2 bytes)
-    let dfd: i32 = unsafe { ctx.read_at(16)? };
-    let filename_ptr: *const u8 = unsafe { ctx.read_at(24)? };
-    let flags: u32 = unsafe { ctx.read_at(32)? };
+    let dfd: i32 = read_field(ctx, repx_common::tp_offsets::OPENAT_ENTER_DFD)?;
+    let filename_ptr: *const u8 =
+        read_field(ctx, repx_common::tp_offsets::OPENAT_ENTER_FILENAME)?;
+    let flags: u32 = read_field(ctx, repx_common::tp_offsets::OPENAT_ENTER_FLAGS)?;
 
     let mut stash = OpenatStash {
         dfd,
@@ -446,8 +463,7 @@ fn try_openat_exit(ctx: &TracePointContext) -> Result<u32, i64> {
     };
     let _ = OPENAT_STASH.remove(&pid_tgid);
 
-    // sys_exit_openat: __syscall_nr at offset 8 (4+4 pad), ret at offset 16.
-    let ret: i64 = unsafe { ctx.read_at(16)? };
+    let ret: i64 = read_field(ctx, repx_common::tp_offsets::OPENAT_EXIT_RET)?;
     let fd = ret as i32;
 
     // Skip failed opens (fd < 0).
@@ -500,8 +516,8 @@ pub fn repx_rename_enter(ctx: TracePointContext) -> u32 {
 
 fn try_rename_enter(ctx: &TracePointContext) -> Result<u32, i64> {
     let pid_tgid = bpf_get_current_pid_tgid();
-    let old_path: *const u8 = unsafe { ctx.read_at(16)? };
-    let new_path: *const u8 = unsafe { ctx.read_at(24)? };
+    let old_path: *const u8 = read_field(ctx, repx_common::tp_offsets::RENAME_ENTER_OLD_PATH)?;
+    let new_path: *const u8 = read_field(ctx, repx_common::tp_offsets::RENAME_ENTER_NEW_PATH)?;
     stash_rename(pid_tgid, -100, old_path, -100, new_path, 0)
 }
 
@@ -514,10 +530,10 @@ pub fn repx_renameat_enter(ctx: TracePointContext) -> u32 {
 
 fn try_renameat_enter(ctx: &TracePointContext) -> Result<u32, i64> {
     let pid_tgid = bpf_get_current_pid_tgid();
-    let old_dfd: i32 = unsafe { ctx.read_at(16)? };
-    let old_path: *const u8 = unsafe { ctx.read_at(24)? };
-    let new_dfd: i32 = unsafe { ctx.read_at(32)? };
-    let new_path: *const u8 = unsafe { ctx.read_at(40)? };
+    let old_dfd: i32 = read_field(ctx, repx_common::tp_offsets::RENAMEAT_ENTER_OLD_DFD)?;
+    let old_path: *const u8 = read_field(ctx, repx_common::tp_offsets::RENAMEAT_ENTER_OLD_PATH)?;
+    let new_dfd: i32 = read_field(ctx, repx_common::tp_offsets::RENAMEAT_ENTER_NEW_DFD)?;
+    let new_path: *const u8 = read_field(ctx, repx_common::tp_offsets::RENAMEAT_ENTER_NEW_PATH)?;
     stash_rename(pid_tgid, old_dfd, old_path, new_dfd, new_path, 0)
 }
 
@@ -530,11 +546,11 @@ pub fn repx_renameat2_enter(ctx: TracePointContext) -> u32 {
 
 fn try_renameat2_enter(ctx: &TracePointContext) -> Result<u32, i64> {
     let pid_tgid = bpf_get_current_pid_tgid();
-    let old_dfd: i32 = unsafe { ctx.read_at(16)? };
-    let old_path: *const u8 = unsafe { ctx.read_at(24)? };
-    let new_dfd: i32 = unsafe { ctx.read_at(32)? };
-    let new_path: *const u8 = unsafe { ctx.read_at(40)? };
-    let flags: u32 = unsafe { ctx.read_at(48)? };
+    let old_dfd: i32 = read_field(ctx, repx_common::tp_offsets::RENAMEAT_ENTER_OLD_DFD)?;
+    let old_path: *const u8 = read_field(ctx, repx_common::tp_offsets::RENAMEAT_ENTER_OLD_PATH)?;
+    let new_dfd: i32 = read_field(ctx, repx_common::tp_offsets::RENAMEAT_ENTER_NEW_DFD)?;
+    let new_path: *const u8 = read_field(ctx, repx_common::tp_offsets::RENAMEAT_ENTER_NEW_PATH)?;
+    let flags: u32 = read_field(ctx, repx_common::tp_offsets::RENAMEAT2_ENTER_FLAGS)?;
     stash_rename(pid_tgid, old_dfd, old_path, new_dfd, new_path, flags)
 }
 
@@ -547,7 +563,7 @@ pub fn repx_unlink_enter(ctx: TracePointContext) -> u32 {
 
 fn try_unlink_enter(ctx: &TracePointContext) -> Result<u32, i64> {
     let pid_tgid = bpf_get_current_pid_tgid();
-    let path: *const u8 = unsafe { ctx.read_at(16)? };
+    let path: *const u8 = read_field(ctx, repx_common::tp_offsets::UNLINK_ENTER_PATH)?;
     stash_unlink(pid_tgid, -100, path, 0)
 }
 
@@ -560,48 +576,48 @@ pub fn repx_unlinkat_enter(ctx: TracePointContext) -> u32 {
 
 fn try_unlinkat_enter(ctx: &TracePointContext) -> Result<u32, i64> {
     let pid_tgid = bpf_get_current_pid_tgid();
-    let dfd: i32 = unsafe { ctx.read_at(16)? };
-    let path: *const u8 = unsafe { ctx.read_at(24)? };
-    let flags: u32 = unsafe { ctx.read_at(32)? };
+    let dfd: i32 = read_field(ctx, repx_common::tp_offsets::UNLINKAT_ENTER_DFD)?;
+    let path: *const u8 = read_field(ctx, repx_common::tp_offsets::UNLINKAT_ENTER_PATH)?;
+    let flags: u32 = read_field(ctx, repx_common::tp_offsets::UNLINKAT_ENTER_FLAGS)?;
     stash_unlink(pid_tgid, dfd, path, flags)
 }
 
 #[tracepoint]
 pub fn repx_rename_exit(ctx: TracePointContext) -> u32 {
-    match try_path_op_exit(&ctx) {
+    match try_path_op_exit(&ctx, repx_common::tp_offsets::RENAME_EXIT_RET) {
         Ok(_) | Err(_) => 0,
     }
 }
 
 #[tracepoint]
 pub fn repx_renameat_exit(ctx: TracePointContext) -> u32 {
-    match try_path_op_exit(&ctx) {
+    match try_path_op_exit(&ctx, repx_common::tp_offsets::RENAMEAT_EXIT_RET) {
         Ok(_) | Err(_) => 0,
     }
 }
 
 #[tracepoint]
 pub fn repx_renameat2_exit(ctx: TracePointContext) -> u32 {
-    match try_path_op_exit(&ctx) {
+    match try_path_op_exit(&ctx, repx_common::tp_offsets::RENAMEAT2_EXIT_RET) {
         Ok(_) | Err(_) => 0,
     }
 }
 
 #[tracepoint]
 pub fn repx_unlink_exit(ctx: TracePointContext) -> u32 {
-    match try_path_op_exit(&ctx) {
+    match try_path_op_exit(&ctx, repx_common::tp_offsets::UNLINK_EXIT_RET) {
         Ok(_) | Err(_) => 0,
     }
 }
 
 #[tracepoint]
 pub fn repx_unlinkat_exit(ctx: TracePointContext) -> u32 {
-    match try_path_op_exit(&ctx) {
+    match try_path_op_exit(&ctx, repx_common::tp_offsets::UNLINKAT_EXIT_RET) {
         Ok(_) | Err(_) => 0,
     }
 }
 
-fn try_path_op_exit(ctx: &TracePointContext) -> Result<u32, i64> {
+fn try_path_op_exit(ctx: &TracePointContext, ret_key: u32) -> Result<u32, i64> {
     let pid_tgid = bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) as u32;
     let pid = pid_tgid as u32;
@@ -610,7 +626,7 @@ fn try_path_op_exit(ctx: &TracePointContext) -> Result<u32, i64> {
         None => return Ok(0),
     };
 
-    let ret: i64 = unsafe { ctx.read_at(16)? };
+    let ret: i64 = read_field(ctx, ret_key)?;
     if ret < 0 {
         remove_path_stash(pid_tgid);
         return Ok(0);
@@ -698,8 +714,7 @@ fn try_close_enter(ctx: &TracePointContext) -> Result<u32, i64> {
     let tgid = (pid_tgid >> 32) as u32;
     let pid = pid_tgid as u32;
 
-    // sys_enter_close: __syscall_nr at offset 8 (4+4 pad), fd at offset 16.
-    let fd: i32 = unsafe { ctx.read_at(16)? };
+    let fd: i32 = read_field(ctx, repx_common::tp_offsets::CLOSE_ENTER_FD)?;
 
     let source: u8;
     if is_tracked(tgid) {
@@ -751,17 +766,9 @@ fn try_mmap_enter(ctx: &TracePointContext) -> Result<u32, i64> {
     let tgid = (pid_tgid >> 32) as u32;
     let pid = pid_tgid as u32;
 
-    // sys_enter_mmap layout (x86-64):
-    //   offset  8: __syscall_nr (int, 4+4 pad)
-    //   offset 16: addr  (unsigned long)
-    //   offset 24: len   (size_t)
-    //   offset 32: prot  (unsigned long)
-    //   offset 40: flags (unsigned long)
-    //   offset 48: fd    (unsigned long)
-    //   offset 56: off   (unsigned long)
-    let prot: u64 = unsafe { ctx.read_at(32)? };
-    let flags: u64 = unsafe { ctx.read_at(40)? };
-    let fd: i64 = unsafe { ctx.read_at(48)? };
+    let prot: u64 = read_field(ctx, repx_common::tp_offsets::MMAP_ENTER_PROT)?;
+    let flags: u64 = read_field(ctx, repx_common::tp_offsets::MMAP_ENTER_FLAGS)?;
+    let fd: i64 = read_field(ctx, repx_common::tp_offsets::MMAP_ENTER_FD)?;
 
     // Only care about file-backed mappings (fd >= 0).
     if fd < 0 {
@@ -831,11 +838,7 @@ fn try_exec(ctx: &TracePointContext) -> Result<u32, i64> {
         return Ok(0);
     }
 
-    // sched_process_exec tracepoint format (after common fields):
-    //   offset 8:  __data_loc char[] filename  (u32: high 16 = len, low 16 = offset)
-    //   offset 12: pid_t pid
-    //   offset 16: pid_t old_pid
-    let data_loc: u32 = unsafe { ctx.read_at(8)? };
+    let data_loc: u32 = read_field(ctx, repx_common::tp_offsets::EXEC_DATA_LOC_FILENAME)?;
     let filename_offset = (data_loc & 0xFFFF) as usize;
     if let Some(mut entry) = EVENTS.reserve::<Event>(0) {
         let event = unsafe { &mut *entry.as_mut_ptr() };
@@ -880,14 +883,10 @@ pub fn repx_fork(ctx: TracePointContext) -> u32 {
 }
 
 fn try_fork(ctx: &TracePointContext) -> Result<u32, i64> {
-    // sched_process_fork layout:
-    //   offset  8: parent_comm[16] (char[16])
-    //   offset 28: child_comm[16]  (char[16])
-    //   offset 44: child_pid       (pid_t, 4 bytes)
     // Use the current thread-group ID for the parent so forks issued by a
     // non-leader thread still attach to the correct process lifetime.
     let parent_pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let child_pid: u32 = unsafe { ctx.read_at(44)? };
+    let child_pid: u32 = read_field(ctx, repx_common::tp_offsets::FORK_CHILD_PID)?;
 
     if !is_tracked(parent_pid) {
         return Ok(0);
@@ -925,26 +924,23 @@ fn try_fork(ctx: &TracePointContext) -> Result<u32, i64> {
 // ---------------------------------------------------------------------------
 #[tracepoint]
 pub fn repx_clone_exit(ctx: TracePointContext) -> u32 {
-    match try_clone_exit(&ctx) {
+    match try_clone_exit(&ctx, repx_common::tp_offsets::CLONE_EXIT_RET) {
         Ok(_) | Err(_) => 0,
     }
 }
 
 #[tracepoint]
 pub fn repx_clone3_exit(ctx: TracePointContext) -> u32 {
-    match try_clone_exit(&ctx) {
+    match try_clone_exit(&ctx, repx_common::tp_offsets::CLONE3_EXIT_RET) {
         Ok(_) | Err(_) => 0,
     }
 }
 
-fn try_clone_exit(ctx: &TracePointContext) -> Result<u32, i64> {
-    // sys_exit_clone / sys_exit_clone3 layout (x86-64):
-    //   offset  8: __syscall_nr (int, 4 bytes + 4 pad)
-    //   offset 16: ret          (long, 8 bytes)
+fn try_clone_exit(ctx: &TracePointContext, ret_key: u32) -> Result<u32, i64> {
     // ret > 0  → parent context, value is child pid.
     // ret == 0 → child context  (already tracked via parent).
     // ret < 0  → syscall error.
-    let ret: i64 = unsafe { ctx.read_at::<i64>(16)? };
+    let ret: i64 = read_field(ctx, ret_key)?;
     if ret <= 0 {
         return Ok(0);
     }

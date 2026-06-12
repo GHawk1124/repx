@@ -199,6 +199,68 @@ pub union EventPayload {
     pub _pad: [u8; core::mem::size_of::<FileOpenEvent>()],
 }
 
+// ---------------------------------------------------------------------------
+// Tracepoint field offset keys
+//
+// These constants identify each tracepoint+field combination in the
+// TRACEPOINT_OFFSETS BPF map.  Userspace discovers the actual byte offsets
+// from /sys/kernel/debug/tracing/events/*/format files at load time.
+// ---------------------------------------------------------------------------
+
+/// Key in the TRACEPOINT_OFFSETS map for each tracepoint field we read.
+/// Encoded as a flat u32; the eBPF program and userspace use the same values.
+pub mod tp_offsets {
+    // sys_enter_openat
+    pub const OPENAT_ENTER_DFD: u32 = 0;
+    pub const OPENAT_ENTER_FILENAME: u32 = 1;
+    pub const OPENAT_ENTER_FLAGS: u32 = 2;
+    // sys_exit_openat
+    pub const OPENAT_EXIT_RET: u32 = 3;
+    // sys_enter_rename
+    pub const RENAME_ENTER_OLD_PATH: u32 = 4;
+    pub const RENAME_ENTER_NEW_PATH: u32 = 5;
+    // sys_enter_renameat
+    pub const RENAMEAT_ENTER_OLD_DFD: u32 = 6;
+    pub const RENAMEAT_ENTER_OLD_PATH: u32 = 7;
+    pub const RENAMEAT_ENTER_NEW_DFD: u32 = 8;
+    pub const RENAMEAT_ENTER_NEW_PATH: u32 = 9;
+    // sys_enter_renameat2 (adds flags)
+    pub const RENAMEAT2_ENTER_FLAGS: u32 = 10;
+    // sys_enter_unlink
+    pub const UNLINK_ENTER_PATH: u32 = 11;
+    // sys_enter_unlinkat
+    pub const UNLINKAT_ENTER_DFD: u32 = 12;
+    pub const UNLINKAT_ENTER_PATH: u32 = 13;
+    pub const UNLINKAT_ENTER_FLAGS: u32 = 14;
+    // sys_enter_close
+    pub const CLOSE_ENTER_FD: u32 = 15;
+    // sys_enter_mmap
+    pub const MMAP_ENTER_PROT: u32 = 16;
+    pub const MMAP_ENTER_FLAGS: u32 = 17;
+    pub const MMAP_ENTER_FD: u32 = 18;
+    // sched_process_exec (__data_loc char[] filename)
+    pub const EXEC_DATA_LOC_FILENAME: u32 = 19;
+    // sched_process_fork
+    pub const FORK_CHILD_PID: u32 = 20;
+    // sys_exit_clone
+    pub const CLONE_EXIT_RET: u32 = 21;
+    // sys_exit_clone3
+    pub const CLONE3_EXIT_RET: u32 = 22;
+    // sys_exit_rename
+    pub const RENAME_EXIT_RET: u32 = 23;
+    // sys_exit_renameat
+    pub const RENAMEAT_EXIT_RET: u32 = 24;
+    // sys_exit_renameat2
+    pub const RENAMEAT2_EXIT_RET: u32 = 25;
+    // sys_exit_unlink
+    pub const UNLINK_EXIT_RET: u32 = 26;
+    // sys_exit_unlinkat
+    pub const UNLINKAT_EXIT_RET: u32 = 27;
+
+    /// Total number of offset keys (one past the last valid index).
+    pub const MAX_OFFSET_KEY: u32 = 28;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
