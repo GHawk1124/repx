@@ -110,7 +110,7 @@ impl Attestation {
         Ok(att)
     }
 
-    fn validate(&mut self) -> Result<()> {
+    pub fn validate(&mut self) -> Result<()> {
         let derived_process_root = self.tree.root_hash();
         match self.version.as_str() {
             "0.1.0" => {

@@ -1,5 +1,6 @@
 mod attestation;
 mod canonicalize;
+mod dsse;
 mod file_identity;
 mod harness;
 mod merkle;
@@ -8,7 +9,7 @@ mod stability;
 mod tracer;
 mod workspace;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -151,6 +152,42 @@ enum Commands {
         /// The command to trace (everything after --).
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
+    },
+
+    /// Generate a fresh Ed25519 key pair for signing attestations.
+    GenerateKey {
+        /// Write the private (signing) key to this path.
+        #[arg(long = "private-key", default_value = "repx-private.key")]
+        private_key: PathBuf,
+
+        /// Write the public (verifying) key to this path.
+        #[arg(long = "public-key", default_value = "repx-public.key")]
+        public_key: PathBuf,
+    },
+
+    /// Sign an attestation, producing a DSSE envelope.
+    Sign {
+        /// Path to the Ed25519 signing key (hex-encoded 32-byte seed).
+        #[arg(short, long)]
+        key: PathBuf,
+
+        /// Path to the attestation file to sign.
+        #[arg(short, long)]
+        attestation: PathBuf,
+
+        /// Output path for the signed DSSE envelope (default: stdout).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Verify a DSSE-signed attestation envelope.
+    VerifySignature {
+        /// Path to the Ed25519 verifying key (hex-encoded 32-byte public key).
+        #[arg(short, long)]
+        key: PathBuf,
+
+        /// Path to the DSSE envelope.
+        envelope: PathBuf,
     },
 }
 
@@ -421,6 +458,76 @@ fn main() -> Result<()> {
             } else {
                 harness::run_harness(&config, &mut std::io::stdout())?;
             }
+            Ok(())
+        }
+        Commands::GenerateKey {
+            private_key,
+            public_key,
+        } => {
+            if private_key.exists() {
+                bail!(
+                    "private key file already exists: {}",
+                    private_key.display()
+                );
+            }
+            if public_key.exists() {
+                bail!(
+                    "public key file already exists: {}",
+                    public_key.display()
+                );
+            }
+
+            let (signing_key, verifying_key) = dsse::generate_key_pair();
+            dsse::write_signing_key(&private_key, &signing_key)?;
+            dsse::write_verifying_key(&public_key, &verifying_key)?;
+
+            println!("Key pair generated:");
+            println!("  Private (signing):  {}", private_key.display());
+            println!("  Public  (verify):    {}", public_key.display());
+            println!();
+            println!("Keep the private key secret. Share the public key with verifiers.");
+            Ok(())
+        }
+        Commands::Sign {
+            key,
+            attestation,
+            output,
+        } => {
+            let signing_key = dsse::read_signing_key(&key)?;
+            let att = attestation::Attestation::read_from_file(&attestation)?;
+
+            let payload = serde_json::to_vec(&att)?;
+            let envelope = dsse::sign(&payload, &att.predicate_type, &signing_key);
+
+            let envelope_json = serde_json::to_string_pretty(&envelope)?;
+            match output {
+                Some(ref path) => {
+                    std::fs::write(path, format!("{envelope_json}\n"))?;
+                    println!("Signed DSSE envelope written to: {}", path.display());
+                }
+                None => {
+                    println!("{envelope_json}");
+                }
+            }
+            Ok(())
+        }
+        Commands::VerifySignature { key, envelope } => {
+            let verifying_key = dsse::read_verifying_key(&key)?;
+            let envelope_data = std::fs::read_to_string(&envelope)
+                .with_context(|| format!("reading envelope from {}", envelope.display()))?;
+            let envelope: dsse::Envelope = serde_json::from_str(&envelope_data)
+                .context("deserializing DSSE envelope")?;
+
+            let payload = dsse::verify(&envelope, &verifying_key)?;
+            let mut att: attestation::Attestation = serde_json::from_slice(&payload)
+                .context("deserializing attestation from verified payload")?;
+            att.validate()?;
+
+            println!("Signature: VERIFIED");
+            println!("Signer key: {}", key.display());
+            println!("Predicate:  {}", att.predicate_type);
+            println!("Root hash:  {}", att.root_hash);
+            println!("Command:    {}", format_command(&att.command));
             Ok(())
         }
     }
