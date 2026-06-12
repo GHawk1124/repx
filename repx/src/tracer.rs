@@ -922,6 +922,7 @@ struct PendingRename {
 
 struct EventCollectorState {
     root_process: ProcessInstance,
+    root_cwd: PathBuf,
     root_initial_exec_pending: bool,
     current_processes: HashMap<u32, ProcessInstance>,
     next_generations: HashMap<u32, u32>,
@@ -940,12 +941,14 @@ impl EventCollectorState {
             },
             exec_epoch: 0,
         };
+        let cwd_for_table = root_cwd.clone();
         Self {
             root_process,
+            root_cwd,
             root_initial_exec_pending: true,
             current_processes: HashMap::from([(root_pid, root_process)]),
             next_generations: HashMap::from([(root_pid, 1)]),
-            process_cwds: HashMap::from([(root_process.lifetime, root_cwd)]),
+            process_cwds: HashMap::from([(root_process.lifetime, cwd_for_table)]),
             fd_table: HashMap::new(),
             pending_renames: HashMap::new(),
             malformed_events: 0,
@@ -1028,6 +1031,19 @@ impl EventCollectorState {
             if let Some(base) = self.process_cwds.get(&process.lifetime) {
                 return base.join(raw_path).to_string_lossy().into_owned();
             }
+        }
+
+        // After deferred processing (timestamp sorting), /proc/{pid}/cwd may
+        // no longer be readable because the process has exited.  All traced
+        // processes inherit the root CWD unless they explicitly chdir, which
+        // build tools do not.  Resolving against the root CWD produces an
+        // absolute path that matches the workspace snapshot keys.
+        if dfd == AT_FDCWD {
+            return self
+                .root_cwd
+                .join(raw_path)
+                .to_string_lossy()
+                .into_owned();
         }
 
         raw_path.to_string()
