@@ -342,14 +342,47 @@ pub fn canonicalize_output_slice(
     }
 
     for orphan_hash in sorted_hashes(&output_hashes) {
-        ops.push(CanonicalOp {
-            op_type: OpType::FileWrite,
-            process_index: u32::MAX,
-            tool_hash: None,
-            args: vec!["output".to_string()],
-            input_hashes: vec![],
-            output_hashes: vec![orphan_hash],
-        });
+        // The BFS did not reach a writer for this hash.  Fall back to an
+        // exhaustive scan: if any process in the trace wrote or renamed
+        // this content, attribute the output to that process.
+        let mut attributed = false;
+        if let Some(writers) = writers_by_hash.get(&orphan_hash) {
+            for writer in writers {
+                if let Some(flow) = flows.get(writer) {
+                    if flow.writes.contains(&orphan_hash)
+                        || flow.renames.contains(&orphan_hash)
+                    {
+                        let process_index = process_to_index
+                            .entry(*writer)
+                            .or_insert_with(|| {
+                                let idx = next_index;
+                                next_index += 1;
+                                idx
+                            });
+                        ops.push(CanonicalOp {
+                            op_type: OpType::FileWrite,
+                            process_index: *process_index,
+                            tool_hash: flow.tool_hash.clone(),
+                            args: vec![],
+                            input_hashes: vec![],
+                            output_hashes: vec![orphan_hash.clone()],
+                        });
+                        attributed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !attributed {
+            ops.push(CanonicalOp {
+                op_type: OpType::FileWrite,
+                process_index: u32::MAX,
+                tool_hash: None,
+                args: vec!["output".to_string()],
+                input_hashes: vec![],
+                output_hashes: vec![orphan_hash],
+            });
+        }
     }
 
     if let Some((process, exit_code)) = root_exit {
